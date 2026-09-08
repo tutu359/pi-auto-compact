@@ -128,9 +128,9 @@ test("shows 压缩中… while pending, then starred estimate after onError", as
 	];
 	const { ctx, statuses } = makeCtx(null, branch);
 	let failCompaction: (() => void) | undefined;
-	(ctx as { compact: unknown }).compact = (
-		options: { onError?: () => void },
-	) => {
+	(ctx as { compact: unknown }).compact = (options: {
+		onError?: () => void;
+	}) => {
 		failCompaction = options.onError;
 	};
 	startSession(handlers, ctx);

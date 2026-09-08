@@ -606,19 +606,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// No dedicated model configured: compaction uses the current session model.
-		if (!compactionModel) return;
+		if (!compactionModel) {
+			const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "session model";
+			ctx.ui.notify(`Compacting with session model (${sessionModel}).`, "info");
+			return;
+		}
 
 		const model = ctx.modelRegistry.find(
 			compactionModel.provider,
 			compactionModel.model,
 		);
-		if (!model) return;
+		if (!model) {
+			ctx.ui.notify(
+				`Compaction model ${compactionModel.provider}/${compactionModel.model} not found; compacting with session model.`,
+				"error",
+			);
+			return;
+		}
 
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
 				ctx.ui.notify(
-					`Compaction model ${compactionModel.provider}/${compactionModel.model} has no usable auth; using session model.`,
+					`Compaction model ${compactionModel.provider}/${compactionModel.model} has no usable auth; compacting with session model.`,
 					"error",
 				);
 				return;
@@ -644,7 +654,11 @@ export default function (pi: ExtensionAPI) {
 				undefined,
 				auth.env,
 			);
-			return { compaction: result };
+			ctx.ui.notify(
+				`Compacted with ${compactionModel.provider}/${compactionModel.model}.`,
+				"info",
+			);
+			return { compaction: result, usedModel: `${compactionModel.provider}/${compactionModel.model}` };
 		} catch (error) {
 			if (event.signal.aborted) return;
 			ctx.ui.notify(
