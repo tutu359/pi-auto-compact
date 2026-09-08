@@ -221,11 +221,36 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
+	/**
+	 * Self-estimated usage percent, used when Pi's usage stats are unknown
+	 * (e.g. right after compaction, before the next LLM response).
+	 */
+	const estimateUsagePercent = (ctx: ExtensionContext): number | null => {
+		const contextWindow =
+			ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return null;
+		try {
+			const entries = ctx.sessionManager.getBranch();
+			const tokens = entries.reduce(
+				(sum, entry) =>
+					entry.type === "message"
+						? sum + estimateTokens(entry.message as AgentMessage)
+						: sum,
+				0,
+			);
+			return (tokens / contextWindow) * 100;
+		} catch {
+			return null;
+		}
+	};
+
 	const compactIfNeeded = (ctx: ExtensionContext, resumeTask = true) => {
 		if (!active || compactionPending) return;
 
 		const usage = ctx.getContextUsage();
-		if (usage?.percent == null || usage.percent <= autoCompactThreshold) return;
+		let percent = usage?.percent ?? null;
+		if (percent == null) percent = estimateUsagePercent(ctx);
+		if (percent == null || percent <= autoCompactThreshold) return;
 
 		compactionPending = true;
 		runCompaction(ctx, resumeTask);
