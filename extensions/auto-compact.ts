@@ -394,7 +394,28 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					const [provider, ...rest] = choice.split("/");
 					const modelId = rest.join("/");
-					const next = { provider, model: modelId };
+
+					// Ask for the compaction thinking level explicitly so the saved
+					// config fully determines compaction behavior.
+					const level = await ctx.ui.select(
+						`Thinking level for compaction with ${provider}/${modelId}`,
+						[
+							"Model default (don't override)",
+							"off",
+							"minimal",
+							"low",
+							"medium",
+							"high",
+							"xhigh",
+							"max",
+						],
+					);
+					if (level === undefined) return;
+
+					const next =
+						level === "Model default (don't override)"
+							? { provider, model: modelId }
+							: { provider, model: modelId, thinkingLevel: level as ThinkingLevel };
 					compactionModel = next;
 					diskConfig.compactionModel = next;
 				}
