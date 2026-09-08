@@ -32,9 +32,6 @@ const COMPACTION_INSTRUCTIONS =
 const RESUME_MESSAGE_TYPE = "pi-auto-compact/resume";
 const RESUME_MESSAGE = "Auto-compact ran. Continue the current task.";
 const COMPACTION_ABORT_ERROR = "This operation was aborted";
-const ACTIVATION_ERROR =
-	"pi-auto-compact failed to activate: Pi built-in auto-compaction is enabled. " +
-	"Set compaction.enabled to false in Pi settings, then restart Pi.";
 
 type AutoCompactConfig = {
 	/** When false, this plugin stays inactive (built-in or no compaction in use). */
@@ -467,9 +464,17 @@ export default function (pi: ExtensionAPI) {
 		if (parsed && !parsed.enabled) {
 			// User chose built-in compaction or off via the menu; stay inactive.
 			active = false;
+		} else if (builtInCompaction) {
+			// Built-in compaction still enabled: stay inactive instead of failing.
+			// The user can pick this plugin via /auto-compact, which disables built-in.
+			active = false;
+			ctx.ui.notify(
+				"pi-auto-compact is inactive: Pi built-in auto-compaction is enabled. " +
+					"Run /auto-compact to choose the compaction owner.",
+				"warning",
+			);
 		} else {
-			active = !builtInCompaction;
-			if (!active) throw new Error(ACTIVATION_ERROR);
+			active = true;
 		}
 
 		// Resume/fork can load an already-large session before first turn.
