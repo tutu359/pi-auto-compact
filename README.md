@@ -23,7 +23,16 @@ pi install <本目录路径 或 你的 npm 包名>
 
 ## 使用
 
-运行 `/auto-compact` 设置阈值（25–99，默认 70）。上下文用量超过阈值时自动压缩，压缩后自动继续当前任务。
+在 Pi 里运行 `/auto-compact`，菜单三项：
+
+1. **Compaction owner** — 谁负责自动压缩：
+   - **This plugin (pi-auto-compact)**：插件接管，同时自动把 `settings.json` 里的 `compaction.enabled` 设为 `false`
+   - **Pi built-in compaction**：用 Pi 原生压缩，插件自动停用（并设 `compaction.enabled` 为 `true`）
+   - **Off (no auto compaction)**：两边都停
+2. **Threshold** — 设置阈值（25–99，默认 70）
+3. **Compaction model** — 选择压缩模型，从 Pi 当前可用的模型列表里直接选，或选第一项恢复用会话模型
+
+选 owner 会直接改写 `~/.pi/agent/settings.json`，无需手动编辑。插件接管时，上下文用量超过阈值自动压缩并继续当前任务。
 
 ## 指定压缩模型（可选）
 

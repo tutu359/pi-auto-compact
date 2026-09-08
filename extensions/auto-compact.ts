@@ -37,6 +37,8 @@ const ACTIVATION_ERROR =
 	"Set compaction.enabled to false in Pi settings, then restart Pi.";
 
 type AutoCompactConfig = {
+	/** When false, this plugin stays inactive (built-in or no compaction in use). */
+	enabled: boolean;
 	autoCompactThreshold: number;
 	/** Optional dedicated compaction model; falls back to the session model. */
 	compactionModel?: CompactionModelConfig;
@@ -113,7 +115,12 @@ function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
 			`autoCompactThreshold must be at least ${MIN_COMPACT_THRESHOLD_PERCENT} and below 100.`,
 		);
 	}
+	const enabled = raw.enabled ?? true;
+	if (typeof enabled !== "boolean") {
+		throw new Error("enabled must be a boolean.");
+	}
 	return {
+		enabled,
 		autoCompactThreshold: threshold,
 		...(raw.compactionModel !== undefined && raw.compactionModel !== null
 			? { compactionModel: parseCompactionModelConfig(raw.compactionModel) }
@@ -302,18 +309,58 @@ export default function (pi: ExtensionAPI) {
 			// Read current on-disk config to preserve fields this menu doesn't touch.
 			let diskConfig: AutoCompactConfig;
 			try {
-				diskConfig = parseAutoCompactConfig(JSON.parse(readFileSync(configPath, "utf8")));
+				diskConfig = parseAutoCompactConfig(
+					JSON.parse(readFileSync(configPath, "utf8")),
+				);
 			} catch {
-				diskConfig = { autoCompactThreshold: autoCompactThreshold };
+				diskConfig = { enabled: true, autoCompactThreshold: autoCompactThreshold };
 			}
 
+			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
+				projectTrusted: ctx.isProjectTrusted(),
+			});
+			const builtInOn = settings.getCompactionEnabled();
+			const ownerLabel = active
+				? "This plugin (pi-auto-compact)"
+				: builtInOn
+					? "Pi built-in compaction"
+					: "Off";
+
 			const action = await ctx.ui.select("Auto-compact settings", [
+				`Compaction owner · current: ${ownerLabel}`,
 				`Threshold · current: ${autoCompactThreshold}%`,
 				`Compaction model · current: ${compactionModel ? `${compactionModel.provider}/${compactionModel.model}` : "session model"}`,
 			]);
 			if (action === undefined) return;
 
-			if (action.startsWith("Threshold")) {
+			if (action.startsWith("Compaction owner")) {
+				const owner = await ctx.ui.select(
+					`Who handles auto compaction? · current: ${ownerLabel}`,
+					[
+						"This plugin (pi-auto-compact)",
+						"Pi built-in compaction",
+						"Off (no auto compaction)",
+					],
+				);
+				if (owner === undefined) return;
+
+				if (owner.startsWith("This plugin")) {
+					settings.setCompactionEnabled(false);
+					diskConfig.enabled = true;
+					active = true;
+				} else if (owner.startsWith("Pi built-in")) {
+					settings.setCompactionEnabled(true);
+					diskConfig.enabled = false;
+					active = false;
+					compactionPending = false;
+				} else {
+					settings.setCompactionEnabled(false);
+					diskConfig.enabled = false;
+					active = false;
+					compactionPending = false;
+				}
+				await settings.flush();
+			} else if (action.startsWith("Threshold")) {
 				const input = await ctx.ui.input(
 					`Auto-compact threshold (%) · current: ${autoCompactThreshold}`,
 					"Enter a number at least 25 and below 100",
@@ -358,10 +405,7 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				await mkdir(join(configPath, ".."), { recursive: true });
-				await writeFileSync(
-					configPath,
-					JSON.stringify(diskConfig, null, "\t"),
-				);
+				await writeFileSync(configPath, JSON.stringify(diskConfig, null, "\t"));
 			} catch {
 				ctx.ui.notify("Couldn't save pi-auto-compact config.", "error");
 				return;
@@ -416,10 +460,17 @@ export default function (pi: ExtensionAPI) {
 			compactionModel = null;
 		}
 
-		active = !SettingsManager.create(ctx.cwd, getAgentDir(), {
+		const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
 			projectTrusted: ctx.isProjectTrusted(),
-		}).getCompactionEnabled();
-		if (!active) throw new Error(ACTIVATION_ERROR);
+		});
+		const builtInCompaction = settings.getCompactionEnabled();
+		if (parsed && !parsed.enabled) {
+			// User chose built-in compaction or off via the menu; stay inactive.
+			active = false;
+		} else {
+			active = !builtInCompaction;
+			if (!active) throw new Error(ACTIVATION_ERROR);
+		}
 
 		// Resume/fork can load an already-large session before first turn.
 		if (event.reason === "resume" || event.reason === "fork")
