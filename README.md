@@ -10,7 +10,7 @@ Fork 自 [HenryQW/pi-harness](https://github.com/HenryQW/pi-harness) 的 `extens
 从 GitHub 安装（推荐）：
 
 ```bash
-pi install github:tutu359/pi-auto-compact
+pi install git:github.com/tutu359/pi-auto-compact
 ```
 
 在 `~/.pi/agent/settings.json` 中禁用 Pi 内置自动压缩：
