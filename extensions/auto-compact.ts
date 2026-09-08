@@ -231,23 +231,37 @@ export default function (pi: ExtensionAPI) {
 		if (contextWindow <= 0) return null;
 		try {
 			const entries = ctx.sessionManager.getBranch();
-			const tokens = entries.reduce((sum, entry) => {
-				if (entry.type === "message") {
-					return sum + estimateTokens(entry.message as AgentMessage);
+			// Respect compaction boundaries: only the last compaction summary and
+			// the entries it kept are actually in context; older entries are folded away.
+			let startIdx = 0;
+			let summaryTokens = 0;
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const entry = entries[i];
+				if (entry.type !== "compaction") continue;
+				const summary = (entry as { summary?: string }).summary ?? "";
+				if (summary) {
+					summaryTokens = estimateTokens({
+						role: "user",
+						content: [{ type: "text", text: summary }],
+						timestamp: Date.now(),
+					} as AgentMessage);
 				}
-				// Compaction summaries occupy real context when rebuilt, count them too.
-				if (entry.type === "compaction") {
-					const summary = (entry as { summary?: string }).summary ?? "";
-					if (summary) {
-						return sum + estimateTokens({
-							role: "user",
-							content: [{ type: "text", text: summary }],
-							timestamp: Date.now(),
-						} as AgentMessage);
-					}
+				const keptId = (entry as { firstKeptEntryId?: string }).firstKeptEntryId;
+				if (keptId) {
+					const keptIdx = entries.findIndex((e) => e.id === keptId);
+					if (keptIdx >= 0) startIdx = keptIdx;
 				}
-				return sum;
-			}, 0);
+				break;
+			}
+			const tokens = entries
+				.slice(startIdx)
+				.reduce(
+					(sum, entry) =>
+						entry.type === "message"
+							? sum + estimateTokens(entry.message as AgentMessage)
+							: sum,
+					summaryTokens,
+				);
 			return (tokens / contextWindow) * 100;
 		} catch {
 			return null;
