@@ -42,30 +42,53 @@ type AutoCompactConfig = {
 	compactionModel?: CompactionModelConfig;
 };
 
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type ThinkingLevel =
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 
 type CompactionModelConfig = {
 	provider: string;
-	id: string;
+	model: string;
 	/** Optional thinking level for the compaction call (default: model default). */
 	thinkingLevel?: ThinkingLevel;
 };
 
 function parseCompactionModelConfig(value: unknown): CompactionModelConfig {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error("compactionModel must be an object with provider and id.");
+		throw new Error("compactionModel must be an object with provider and model.");
 	}
-	const { provider, id, thinkingLevel } = value as Record<string, unknown>;
-	if (typeof provider !== "string" || !provider.trim() || typeof id !== "string" || !id.trim()) {
-		throw new Error("compactionModel.provider and compactionModel.id must be non-empty strings.");
+	const { provider, model, thinkingLevel } = value as Record<string, unknown>;
+	if (
+		typeof provider !== "string" ||
+		!provider.trim() ||
+		typeof model !== "string" ||
+		!model.trim()
+	) {
+		throw new Error(
+			"compactionModel.provider and compactionModel.model must be non-empty strings.",
+		);
 	}
-	if (thinkingLevel !== undefined && !"off,minimal,low,medium,high,xhigh,max".split(",").includes(thinkingLevel as string)) {
-		throw new Error(`compactionModel.thinkingLevel must be one of off, minimal, low, medium, high, xhigh, max; got ${JSON.stringify(thinkingLevel)}.`);
+	if (
+		thinkingLevel !== undefined &&
+		!"off,minimal,low,medium,high,xhigh,max"
+			.split(",")
+			.includes(thinkingLevel as string)
+	) {
+		throw new Error(
+			`compactionModel.thinkingLevel must be one of off, minimal, low, medium, high, xhigh, max; got ${JSON.stringify(thinkingLevel)}.`,
+		);
 	}
 	return {
 		provider: provider.trim(),
-		id: id.trim(),
-		...(thinkingLevel !== undefined ? { thinkingLevel: thinkingLevel as ThinkingLevel } : {}),
+		model: model.trim(),
+		...(thinkingLevel === undefined
+			? {}
+			: { thinkingLevel: thinkingLevel as ThinkingLevel }),
 	};
 }
 
@@ -84,8 +107,7 @@ function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
 	}
 	const raw = value as Record<string, unknown>;
 	const threshold =
-		raw.autoCompactThreshold ??
-		DEFAULT_COMPACT_THRESHOLD_PERCENT;
+		raw.autoCompactThreshold ?? DEFAULT_COMPACT_THRESHOLD_PERCENT;
 	if (!isValidThreshold(threshold)) {
 		throw new Error(
 			`autoCompactThreshold must be at least ${MIN_COMPACT_THRESHOLD_PERCENT} and below 100.`,
@@ -266,7 +288,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("auto-compact", {
-		description: "configure automatic compaction threshold",
+		description: "configure automatic compaction threshold and model",
 		handler: async (args, ctx) => {
 			if (args.trim()) {
 				ctx.ui.notify("Usage: /auto-compact", "error");
@@ -277,30 +299,80 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const input = await ctx.ui.input(
-				`Auto-compact threshold (%) · current: ${autoCompactThreshold}`,
-				"Enter a number at least 25 and below 100",
-			);
-			if (input === undefined) return;
-
-			const threshold = Number(input.trim());
-			if (!isValidThreshold(threshold)) {
-				ctx.ui.notify("Threshold must be at least 25% and below 100%.", "error");
-				return;
+			// Read current on-disk config to preserve fields this menu doesn't touch.
+			let diskConfig: AutoCompactConfig;
+			try {
+				diskConfig = parseAutoCompactConfig(JSON.parse(readFileSync(configPath, "utf8")));
+			} catch {
+				diskConfig = { autoCompactThreshold: autoCompactThreshold };
 			}
+
+			const action = await ctx.ui.select("Auto-compact settings", [
+				`Threshold · current: ${autoCompactThreshold}%`,
+				`Compaction model · current: ${compactionModel ? `${compactionModel.provider}/${compactionModel.model}` : "session model"}`,
+			]);
+			if (action === undefined) return;
+
+			if (action.startsWith("Threshold")) {
+				const input = await ctx.ui.input(
+					`Auto-compact threshold (%) · current: ${autoCompactThreshold}`,
+					"Enter a number at least 25 and below 100",
+				);
+				if (input === undefined) return;
+
+				const threshold = Number(input.trim());
+				if (!isValidThreshold(threshold)) {
+					ctx.ui.notify("Threshold must be at least 25% and below 100%.", "error");
+					return;
+				}
+				diskConfig.autoCompactThreshold = threshold;
+				autoCompactThreshold = threshold;
+			} else if (action.startsWith("Compaction model")) {
+				const available = ctx.modelRegistry.getAvailable();
+				if (!available.length) {
+					ctx.ui.notify("No available models found.", "error");
+					return;
+				}
+
+				const options = [
+					"Use current session model (no dedicated model)",
+					...available.map((m) => `${m.provider}/${m.id}`),
+				];
+				const choice = await ctx.ui.select(
+					"Pick the model used for compaction",
+					options,
+				);
+				if (choice === undefined) return;
+
+				if (choice.startsWith("Use current session model")) {
+					compactionModel = null;
+					delete (diskConfig as { compactionModel?: unknown }).compactionModel;
+				} else {
+					const [provider, ...rest] = choice.split("/");
+					const modelId = rest.join("/");
+					const next = { provider, model: modelId };
+					compactionModel = next;
+					diskConfig.compactionModel = next;
+				}
+			} else return;
 
 			try {
 				await mkdir(join(configPath, ".."), { recursive: true });
 				await writeFileSync(
 					configPath,
-					JSON.stringify({ autoCompactThreshold: threshold }, null, "\t"),
+					JSON.stringify(diskConfig, null, "\t"),
 				);
 			} catch {
 				ctx.ui.notify("Couldn't save pi-auto-compact config.", "error");
 				return;
 			}
-			autoCompactThreshold = threshold;
-			ctx.ui.notify(`Auto-compact threshold set to ${threshold}%.`, "info");
+			ctx.ui.notify(
+				compactionModel
+					? `Auto-compact: threshold ${autoCompactThreshold}%, model ${compactionModel.provider}/${compactionModel.model}.`
+					: `Auto-compact: threshold ${autoCompactThreshold}%, session model.`,
+				"info",
+			);
+			ctx.ui.notify("Restart Pi for model changes to take effect.", "info");
 		},
 	});
 
@@ -330,15 +402,15 @@ export default function (pi: ExtensionAPI) {
 		if (configuredModel) {
 			const model = ctx.modelRegistry.find(
 				configuredModel.provider,
-				configuredModel.id,
+				configuredModel.model,
 			);
-			if (!model) {
+			if (model) {
+				compactionModel = configuredModel;
+			} else {
 				ctx.ui.notify(
-					`Compaction model ${configuredModel.provider}/${configuredModel.id} not found; using session model.`,
+					`Compaction model ${configuredModel.provider}/${configuredModel.model} not found; using session model.`,
 					"error",
 				);
-			} else {
-				compactionModel = configuredModel;
 			}
 		} else {
 			compactionModel = null;
@@ -384,7 +456,7 @@ export default function (pi: ExtensionAPI) {
 
 		const model = ctx.modelRegistry.find(
 			compactionModel.provider,
-			compactionModel.id,
+			compactionModel.model,
 		);
 		if (!model) return;
 
@@ -392,7 +464,7 @@ export default function (pi: ExtensionAPI) {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
 				ctx.ui.notify(
-					`Compaction model ${compactionModel.provider}/${compactionModel.id} has no usable auth; using session model.`,
+					`Compaction model ${compactionModel.provider}/${compactionModel.model} has no usable auth; using session model.`,
 					"error",
 				);
 				return;
@@ -422,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			if (event.signal.aborted) return;
 			ctx.ui.notify(
-				`Compaction with ${compactionModel.provider}/${compactionModel.id} failed; using session model. ${(error as Error).message}`,
+				`Compaction with ${compactionModel.provider}/${compactionModel.model} failed; using session model. ${(error as Error).message}`,
 				"error",
 			);
 		}

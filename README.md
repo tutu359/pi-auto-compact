@@ -27,20 +27,31 @@ pi install <本目录路径 或 你的 npm 包名>
 
 ## 指定压缩模型（可选）
 
-默认用当前会话模型压缩。想用别的大窗口模型或便宜模型专门跑压缩，编辑 `~/.pi/agent/config/pi-auto-compact/config.json`：
+两种方式任选：
+
+### 方式一：菜单配置（推荐）
+
+在 Pi 里运行 `/auto-compact`，会先弹出设置菜单：
+
+1. **Threshold** — 设置阈值（25–99，默认 70）
+2. **Compaction model** — 选择压缩模型，从 Pi 当前可用的模型列表里直接选，或选第一项恢复用会话模型
+
+### 方式二：手动编辑配置文件
+
+编辑 `~/.pi/agent/config/pi-auto-compact/config.json`：
 
 ```json
 {
   "autoCompactThreshold": 70,
   "compactionModel": {
     "provider": "google",
-    "id": "gemini-2.5-pro",
+    "model": "gemini-2.5-pro",
     "thinkingLevel": "low"
   }
 }
 ```
 
-- `provider` / `id`：与 Pi 模型注册表一致（即 `/model` 列表里的 provider 和模型 id）。该模型需已在 Pi 中配置好认证（API key 或 OAuth）。
+- `provider` / `model`：与 Pi 模型注册表一致（即 `/model` 列表里的 provider 和模型 id）。该模型需已在 Pi 中配置好认证（API key 或 OAuth）。
 - `thinkingLevel`：可选，`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。压缩任务建议 `low` 或 `off` 省钱。
 - 模型不存在或认证不可用时，自动回退到当前会话模型并提示。
 - 删除 `compactionModel` 字段即恢复用会话模型。改完重启 Pi 生效。
