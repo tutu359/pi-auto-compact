@@ -111,7 +111,7 @@ test("falls back to self-estimated usage when Pi stats are null", async () => {
 	assert.equal(statuses.get(STATUS_KEY), "ac: 11%/70%");
 });
 
-test("shows 压缩中… while pending, then starred estimate after onError", async () => {
+test("shows compacting… with model name while pending, then starred estimate after onError", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
 	// ~29200 chars/4 = 7300 tokens = 73% of 10k window, above the 70% threshold.
@@ -135,7 +135,8 @@ test("shows 压缩中… while pending, then starred estimate after onError", as
 	};
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: 压缩中…");
+	// No compactionModel in the test agent dir, so no @model suffix.
+	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
 	failCompaction?.();
 	assert.equal(statuses.get(STATUS_KEY), "ac: 73%/70% *");
 });

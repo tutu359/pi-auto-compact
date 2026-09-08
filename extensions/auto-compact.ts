@@ -195,7 +195,7 @@ export default function (pi: ExtensionAPI) {
 
 	const runCompaction = (ctx: ExtensionContext, resumeTask = true) => {
 		compactionAbortExpected = Boolean(ctx.signal && !ctx.signal.aborted);
-		ctx.ui.setStatus(STATUS_KEY, "ac: 压缩中…");
+		setCompactingStatus(ctx);
 		ctx.compact({
 			customInstructions: COMPACTION_INSTRUCTIONS,
 			onComplete: () => {
@@ -281,13 +281,20 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		// Note: the starred form is normally transient — a decision that exceeds
-		// the threshold proceeds into runCompaction, which overwrites this with
-		// 压缩中…. The star stays visible only via onError recovery below.
 		const star = percent > autoCompactThreshold ? " *" : "";
 		ctx.ui.setStatus(
 			STATUS_KEY,
 			`ac: ${Math.round(percent)}%/${autoCompactThreshold}%${star}`,
+		);
+	};
+
+	/** Compaction-in-progress status; model name shown only here. */
+	const setCompactingStatus = (ctx: ExtensionContext) => {
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			compactionModel
+				? `ac: compacting… @${compactionModel.model}`
+				: "ac: compacting…",
 		);
 	};
 
@@ -607,7 +614,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		// No dedicated model configured: compaction uses the current session model.
 		if (!compactionModel) {
-			const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "session model";
+			const sessionModel = ctx.model
+				? `${ctx.model.provider}/${ctx.model.id}`
+				: "session model";
 			ctx.ui.notify(`Compacting with session model (${sessionModel}).`, "info");
 			return;
 		}
@@ -658,7 +667,10 @@ export default function (pi: ExtensionAPI) {
 				`Compacted with ${compactionModel.provider}/${compactionModel.model}.`,
 				"info",
 			);
-			return { compaction: result, usedModel: `${compactionModel.provider}/${compactionModel.model}` };
+			return {
+				compaction: result,
+				usedModel: `${compactionModel.provider}/${compactionModel.model}`,
+			};
 		} catch (error) {
 			if (event.signal.aborted) return;
 			ctx.ui.notify(
