@@ -1,4 +1,5 @@
 import {
+	compact,
 	estimateTokens,
 	getAgentDir,
 	SettingsManager,
@@ -26,7 +27,8 @@ type AgentMessage = Parameters<typeof estimateTokens>[0];
 const DEFAULT_COMPACT_THRESHOLD_PERCENT = 70;
 const MIN_COMPACT_THRESHOLD_PERCENT = 25;
 const KEEP_RECENT_PERCENT = 15;
-const COMPACTION_INSTRUCTIONS = "Preserve current task to be resumed after compaction.";
+const COMPACTION_INSTRUCTIONS =
+	"Preserve current task to be resumed after compaction.";
 const RESUME_MESSAGE_TYPE = "pi-auto-compact/resume";
 const RESUME_MESSAGE = "Auto-compact ran. Continue the current task.";
 const COMPACTION_ABORT_ERROR = "This operation was aborted";
@@ -34,21 +36,67 @@ const ACTIVATION_ERROR =
 	"pi-auto-compact failed to activate: Pi built-in auto-compaction is enabled. " +
 	"Set compaction.enabled to false in Pi settings, then restart Pi.";
 
-type AutoCompactConfig = { autoCompactThreshold: number };
+type AutoCompactConfig = {
+	autoCompactThreshold: number;
+	/** Optional dedicated compaction model; falls back to the session model. */
+	compactionModel?: CompactionModelConfig;
+};
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+type CompactionModelConfig = {
+	provider: string;
+	id: string;
+	/** Optional thinking level for the compaction call (default: model default). */
+	thinkingLevel?: ThinkingLevel;
+};
+
+function parseCompactionModelConfig(value: unknown): CompactionModelConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("compactionModel must be an object with provider and id.");
+	}
+	const { provider, id, thinkingLevel } = value as Record<string, unknown>;
+	if (typeof provider !== "string" || !provider.trim() || typeof id !== "string" || !id.trim()) {
+		throw new Error("compactionModel.provider and compactionModel.id must be non-empty strings.");
+	}
+	if (thinkingLevel !== undefined && !"off,minimal,low,medium,high,xhigh,max".split(",").includes(thinkingLevel as string)) {
+		throw new Error(`compactionModel.thinkingLevel must be one of off, minimal, low, medium, high, xhigh, max; got ${JSON.stringify(thinkingLevel)}.`);
+	}
+	return {
+		provider: provider.trim(),
+		id: id.trim(),
+		...(thinkingLevel !== undefined ? { thinkingLevel: thinkingLevel as ThinkingLevel } : {}),
+	};
+}
 
 function isValidThreshold(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value) && value >= MIN_COMPACT_THRESHOLD_PERCENT && value < 100;
+	return (
+		typeof value === "number" &&
+		Number.isFinite(value) &&
+		value >= MIN_COMPACT_THRESHOLD_PERCENT &&
+		value < 100
+	);
 }
 
 function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new Error("Config must be an object.");
 	}
-	const threshold = (value as Record<string, unknown>).autoCompactThreshold ?? DEFAULT_COMPACT_THRESHOLD_PERCENT;
+	const raw = value as Record<string, unknown>;
+	const threshold =
+		raw.autoCompactThreshold ??
+		DEFAULT_COMPACT_THRESHOLD_PERCENT;
 	if (!isValidThreshold(threshold)) {
-		throw new Error(`autoCompactThreshold must be at least ${MIN_COMPACT_THRESHOLD_PERCENT} and below 100.`);
+		throw new Error(
+			`autoCompactThreshold must be at least ${MIN_COMPACT_THRESHOLD_PERCENT} and below 100.`,
+		);
 	}
-	return { autoCompactThreshold: threshold };
+	return {
+		autoCompactThreshold: threshold,
+		...(raw.compactionModel !== undefined && raw.compactionModel !== null
+			? { compactionModel: parseCompactionModelConfig(raw.compactionModel) }
+			: {}),
+	};
 }
 
 /** Estimate current request size using same estimator Pi uses. */
@@ -69,7 +117,10 @@ function snapToUserBoundary(messages: AgentMessage[], index: number): number {
  * Return temporary context containing newest messages plus notice.
  * This changes only request context; session history remains intact.
  */
-function keepRecent(messages: AgentMessage[], keepTokens: number): AgentMessage[] | null {
+function keepRecent(
+	messages: AgentMessage[],
+	keepTokens: number,
+): AgentMessage[] | null {
 	let tokens = 0;
 	let cutIndex = 0;
 
@@ -109,6 +160,7 @@ type CompactionDetails = { readFiles?: unknown; modifiedFiles?: unknown };
 export default function (pi: ExtensionAPI) {
 	let active = false;
 	let autoCompactThreshold = DEFAULT_COMPACT_THRESHOLD_PERCENT;
+	let compactionModel: CompactionModelConfig | null = null;
 	let configPath: string | null = null;
 	// Prevent lifecycle hooks from starting duplicate summaries.
 	let compactionPending = false;
@@ -126,11 +178,14 @@ export default function (pi: ExtensionAPI) {
 				// before checking idle, otherwise follow-up can race that flush.
 				setImmediate(() => {
 					if (!ctx.isIdle()) return;
-					pi.sendMessage({
-						customType: RESUME_MESSAGE_TYPE,
-						content: RESUME_MESSAGE,
-						display: false,
-					}, { triggerTurn: true });
+					pi.sendMessage(
+						{
+							customType: RESUME_MESSAGE_TYPE,
+							content: RESUME_MESSAGE,
+							display: false,
+						},
+						{ triggerTurn: true },
+					);
 				});
 			},
 			onError: () => {
@@ -161,7 +216,8 @@ export default function (pi: ExtensionAPI) {
 			message.stopReason !== "error" ||
 			message.errorMessage !== COMPACTION_ABORT_ERROR ||
 			message.content.some((part) => part.type !== "text" || part.text !== "")
-		) return;
+		)
+			return;
 
 		compactionAbortExpected = false;
 		return {
@@ -187,13 +243,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event, ctx) => {
 		if (!active || compactionPending) return;
 
-		const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		const contextWindow =
+			ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		const estimatedTokens = estimateTotalTokens(event.messages);
-		if (contextWindow <= 0 || estimatedTokens <= contextWindow * autoCompactThreshold / 100) return;
+		if (
+			contextWindow <= 0 ||
+			estimatedTokens <= (contextWindow * autoCompactThreshold) / 100
+		)
+			return;
 
 		const truncated = keepRecent(
 			event.messages,
-			Math.floor(contextWindow * KEEP_RECENT_PERCENT / 100),
+			Math.floor((contextWindow * KEEP_RECENT_PERCENT) / 100),
 		);
 		if (!truncated) return;
 
@@ -230,7 +291,10 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				await mkdir(join(configPath, ".."), { recursive: true });
-				await writeFileSync(configPath, JSON.stringify({ autoCompactThreshold: threshold }, null, "\t"));
+				await writeFileSync(
+					configPath,
+					JSON.stringify({ autoCompactThreshold: threshold }, null, "\t"),
+				);
 			} catch {
 				ctx.ui.notify("Couldn't save pi-auto-compact config.", "error");
 				return;
@@ -244,16 +308,40 @@ export default function (pi: ExtensionAPI) {
 	// activation unless effective global/project settings disable it.
 	pi.on("session_start", (event, ctx) => {
 		configPath = join(getAgentDir(), "config", "pi-auto-compact", "config.json");
+		let parsed: AutoCompactConfig | null = null;
 		try {
-			const parsed = parseAutoCompactConfig(JSON.parse(readFileSync(configPath, "utf8")));
+			parsed = parseAutoCompactConfig(
+				JSON.parse(readFileSync(configPath, "utf8")),
+			);
 			autoCompactThreshold = parsed.autoCompactThreshold;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 				autoCompactThreshold = DEFAULT_COMPACT_THRESHOLD_PERCENT;
 			} else {
 				autoCompactThreshold = DEFAULT_COMPACT_THRESHOLD_PERCENT;
-				ctx.ui.notify(`Couldn't read pi-auto-compact config; using ${DEFAULT_COMPACT_THRESHOLD_PERCENT}%.`, "error");
+				ctx.ui.notify(
+					`Couldn't read pi-auto-compact config; using ${DEFAULT_COMPACT_THRESHOLD_PERCENT}%.`,
+					"error",
+				);
 			}
+		}
+
+		const configuredModel = parsed?.compactionModel ?? null;
+		if (configuredModel) {
+			const model = ctx.modelRegistry.find(
+				configuredModel.provider,
+				configuredModel.id,
+			);
+			if (!model) {
+				ctx.ui.notify(
+					`Compaction model ${configuredModel.provider}/${configuredModel.id} not found; using session model.`,
+					"error",
+				);
+			} else {
+				compactionModel = configuredModel;
+			}
+		} else {
+			compactionModel = null;
 		}
 
 		active = !SettingsManager.create(ctx.cwd, getAgentDir(), {
@@ -262,18 +350,22 @@ export default function (pi: ExtensionAPI) {
 		if (!active) throw new Error(ACTIVATION_ERROR);
 
 		// Resume/fork can load an already-large session before first turn.
-		if (event.reason === "resume" || event.reason === "fork") compactIfNeeded(ctx);
+		if (event.reason === "resume" || event.reason === "fork")
+			compactIfNeeded(ctx);
 	});
 
-	pi.on("session_before_compact", (event, ctx) => {
+	pi.on("session_before_compact", async (event, ctx) => {
 		if (
 			!active ||
 			!compactionPending ||
 			event.customInstructions !== COMPACTION_INSTRUCTIONS
-		) return;
+		)
+			return;
 
 		// Pi omits details from prior extension compactions when preparing next run.
-		const previous = [...event.branchEntries].reverse().find((entry) => entry.type === "compaction");
+		const previous = [...event.branchEntries]
+			.reverse()
+			.find((entry) => entry.type === "compaction");
 		if (previous?.details && typeof previous.details === "object") {
 			const details = previous.details as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
@@ -287,7 +379,52 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		// Without task-model routing, compaction uses the current session model.
-		void ctx;
+		// No dedicated model configured: compaction uses the current session model.
+		if (!compactionModel) return;
+
+		const model = ctx.modelRegistry.find(
+			compactionModel.provider,
+			compactionModel.id,
+		);
+		if (!model) return;
+
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) {
+				ctx.ui.notify(
+					`Compaction model ${compactionModel.provider}/${compactionModel.id} has no usable auth; using session model.`,
+					"error",
+				);
+				return;
+			}
+
+			const requestModel = auth.baseUrl
+				? { ...model, baseUrl: auth.baseUrl }
+				: model;
+			const result = await compact(
+				event.preparation,
+				requestModel,
+				auth.apiKey,
+				auth.headers
+					? (Object.fromEntries(
+							Object.entries(auth.headers).filter(
+								(entry): entry is [string, string] => entry[1] !== null,
+							),
+						) as Record<string, string>)
+					: undefined,
+				event.customInstructions,
+				event.signal,
+				compactionModel.thinkingLevel,
+				undefined,
+				auth.env,
+			);
+			return { compaction: result };
+		} catch (error) {
+			if (event.signal.aborted) return;
+			ctx.ui.notify(
+				`Compaction with ${compactionModel.provider}/${compactionModel.id} failed; using session model. ${(error as Error).message}`,
+				"error",
+			);
+		}
 	});
 }
