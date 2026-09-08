@@ -317,35 +317,32 @@ export default function (pi: ExtensionAPI) {
 				projectTrusted: ctx.isProjectTrusted(),
 			});
 			const builtInOn = settings.getCompactionEnabled();
-			const ownerLabel = active
-				? "This plugin (pi-auto-compact)"
-				: builtInOn
-					? "Pi built-in compaction"
-					: "Off";
+			const ownerValue = active ? "thisPlugin" : builtInOn ? "builtIn" : "off";
+			const modelValue = compactionModel
+				? `${compactionModel.provider}/${compactionModel.model}`
+				: "sessionModel";
 
-			const action = await ctx.ui.select("Auto-compact settings", [
-				`Compaction owner · current: ${ownerLabel}`,
-				`Threshold · current: ${autoCompactThreshold}%`,
-				`Compaction model · current: ${compactionModel ? `${compactionModel.provider}/${compactionModel.model}` : "session model"}`,
+			const action = await ctx.ui.select("/auto-compact", [
+				`compactionOwner → ${ownerValue}`,
+				`threshold → ${autoCompactThreshold}%`,
+				`compactionModel → ${modelValue}`,
 			]);
 			if (action === undefined) return;
 
-			if (action.startsWith("Compaction owner")) {
+			if (action.startsWith("compactionOwner")) {
+				const OWNER_OPTIONS = ["thisPlugin", "builtIn", "off"] as const;
 				const owner = await ctx.ui.select(
-					`Who handles auto compaction? · current: ${ownerLabel}`,
-					[
-						"This plugin (pi-auto-compact)",
-						"Pi built-in compaction",
-						"Off (no auto compaction)",
-					],
+					"compactionOwner",
+					OWNER_OPTIONS.map((o) => (o === ownerValue ? `→ ${o}` : o)),
 				);
 				if (owner === undefined) return;
+				const chosen = owner.replace("→ ", "");
 
-				if (owner.startsWith("This plugin")) {
+				if (chosen === "thisPlugin") {
 					settings.setCompactionEnabled(false);
 					diskConfig.enabled = true;
 					active = true;
-				} else if (owner.startsWith("Pi built-in")) {
+				} else if (chosen === "builtIn") {
 					settings.setCompactionEnabled(true);
 					diskConfig.enabled = false;
 					active = false;
@@ -357,9 +354,9 @@ export default function (pi: ExtensionAPI) {
 					compactionPending = false;
 				}
 				await settings.flush();
-			} else if (action.startsWith("Threshold")) {
+			} else if (action.startsWith("threshold")) {
 				const input = await ctx.ui.input(
-					`Auto-compact threshold (%) · current: ${autoCompactThreshold}`,
+					`threshold (%) · current: ${autoCompactThreshold}`,
 					"Enter a number at least 25 and below 100",
 				);
 				if (input === undefined) return;
@@ -371,28 +368,30 @@ export default function (pi: ExtensionAPI) {
 				}
 				diskConfig.autoCompactThreshold = threshold;
 				autoCompactThreshold = threshold;
-			} else if (action.startsWith("Compaction model")) {
+			} else if (action.startsWith("compactionModel")) {
 				const available = ctx.modelRegistry.getAvailable();
 				if (!available.length) {
 					ctx.ui.notify("No available models found.", "error");
 					return;
 				}
 
+				const sessionOption = "sessionModel";
 				const options = [
-					"Use current session model (no dedicated model)",
+					sessionOption,
 					...available.map((m) => `${m.provider}/${m.id}`),
 				];
 				const choice = await ctx.ui.select(
-					"Pick the model used for compaction",
-					options,
+					"compactionModel",
+					options.map((o) => (o === modelValue ? `→ ${o}` : o)),
 				);
 				if (choice === undefined) return;
+				const picked = choice.replace("→ ", "");
 
-				if (choice.startsWith("Use current session model")) {
+				if (picked === sessionOption) {
 					compactionModel = null;
 					delete (diskConfig as { compactionModel?: unknown }).compactionModel;
 				} else {
-					const [provider, ...rest] = choice.split("/");
+					const [provider, ...rest] = picked.split("/");
 					const modelId = rest.join("/");
 
 					// Ask for the compaction thinking level explicitly so the saved
