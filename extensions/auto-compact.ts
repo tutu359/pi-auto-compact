@@ -231,13 +231,23 @@ export default function (pi: ExtensionAPI) {
 		if (contextWindow <= 0) return null;
 		try {
 			const entries = ctx.sessionManager.getBranch();
-			const tokens = entries.reduce(
-				(sum, entry) =>
-					entry.type === "message"
-						? sum + estimateTokens(entry.message as AgentMessage)
-						: sum,
-				0,
-			);
+			const tokens = entries.reduce((sum, entry) => {
+				if (entry.type === "message") {
+					return sum + estimateTokens(entry.message as AgentMessage);
+				}
+				// Compaction summaries occupy real context when rebuilt, count them too.
+				if (entry.type === "compaction") {
+					const summary = (entry as { summary?: string }).summary ?? "";
+					if (summary) {
+						return sum + estimateTokens({
+							role: "user",
+							content: [{ type: "text", text: summary }],
+							timestamp: Date.now(),
+						} as AgentMessage);
+					}
+				}
+				return sum;
+			}, 0);
 			return (tokens / contextWindow) * 100;
 		} catch {
 			return null;
