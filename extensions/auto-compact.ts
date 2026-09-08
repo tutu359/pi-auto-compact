@@ -32,6 +32,7 @@ const COMPACTION_INSTRUCTIONS =
 const RESUME_MESSAGE_TYPE = "pi-auto-compact/resume";
 const RESUME_MESSAGE = "Auto-compact ran. Continue the current task.";
 const COMPACTION_ABORT_ERROR = "This operation was aborted";
+const STATUS_KEY = "ac";
 
 type AutoCompactConfig = {
 	/** When false, this plugin stays inactive (built-in or no compaction in use). */
@@ -194,11 +195,13 @@ export default function (pi: ExtensionAPI) {
 
 	const runCompaction = (ctx: ExtensionContext, resumeTask = true) => {
 		compactionAbortExpected = Boolean(ctx.signal && !ctx.signal.aborted);
+		ctx.ui.setStatus(STATUS_KEY, "ac: 压缩中…");
 		ctx.compact({
 			customInstructions: COMPACTION_INSTRUCTIONS,
 			onComplete: () => {
 				compactionPending = false;
 				compactionAbortExpected = false;
+				updateStatus(ctx, estimateUsagePercent(ctx));
 				if (!resumeTask) return;
 				// Pi may flush queued input during compaction_end. Wait one macrotask
 				// before checking idle, otherwise follow-up can race that flush.
@@ -217,6 +220,7 @@ export default function (pi: ExtensionAPI) {
 			onError: () => {
 				compactionPending = false;
 				compactionAbortExpected = false;
+				updateStatus(ctx, estimateUsagePercent(ctx));
 			},
 		});
 	};
@@ -268,12 +272,32 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Status bar display, same source as the compaction decision: shows the
+	 * exact percent value the check below just used against the threshold.
+	 */
+	const updateStatus = (ctx: ExtensionContext, percent: number | null) => {
+		if (!active || percent == null) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		// Note: the starred form is normally transient — a decision that exceeds
+		// the threshold proceeds into runCompaction, which overwrites this with
+		// 压缩中…. The star stays visible only via onError recovery below.
+		const star = percent > autoCompactThreshold ? " *" : "";
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			`ac: ${Math.round(percent)}%/${autoCompactThreshold}%${star}`,
+		);
+	};
+
 	const compactIfNeeded = (ctx: ExtensionContext, resumeTask = true) => {
 		if (!active || compactionPending) return;
 
 		const usage = ctx.getContextUsage();
 		let percent = usage?.percent ?? null;
 		if (percent == null) percent = estimateUsagePercent(ctx);
+		updateStatus(ctx, percent);
 		if (percent == null || percent <= autoCompactThreshold) return;
 
 		compactionPending = true;
@@ -321,6 +345,9 @@ export default function (pi: ExtensionAPI) {
 		const contextWindow =
 			ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		const estimatedTokens = estimateTotalTokens(event.messages);
+		const estimatedPercent =
+			contextWindow > 0 ? (estimatedTokens / contextWindow) * 100 : null;
+		updateStatus(ctx, estimatedPercent);
 		if (
 			contextWindow <= 0 ||
 			estimatedTokens <= (contextWindow * autoCompactThreshold) / 100
@@ -396,11 +423,13 @@ export default function (pi: ExtensionAPI) {
 					diskConfig.enabled = false;
 					active = false;
 					compactionPending = false;
+					ctx.ui.setStatus(STATUS_KEY, undefined);
 				} else {
 					settings.setCompactionEnabled(false);
 					diskConfig.enabled = false;
 					active = false;
 					compactionPending = false;
+					ctx.ui.setStatus(STATUS_KEY, undefined);
 				}
 				await settings.flush();
 			} else if (action.startsWith("threshold")) {
