@@ -39,20 +39,29 @@ function loadExtension(): Map<string, Handler> {
 function makeCtx(
 	percent: number | null,
 	branch: unknown[] = [],
+	tokens = percent == null ? null : 4200,
 ): {
 	ctx: ExtensionContext;
 	statuses: Map<string, string>;
+	compactions: Array<{ onComplete?: () => void; onError?: () => void }>;
 } {
 	const statuses = new Map<string, string>();
+	const compactions: Array<{
+		onComplete?: () => void;
+		onError?: () => void;
+	}> = [];
 	const ctx = {
 		cwd: process.cwd(),
 		isProjectTrusted: () => true,
 		getContextUsage: () => ({
-			tokens: percent == null ? null : 4200,
+			tokens,
 			contextWindow: 10000,
 			percent,
 		}),
-		compact() {},
+		compact(options: { onComplete?: () => void; onError?: () => void }) {
+			compactions.push(options);
+		},
+		isIdle: () => false,
 		ui: {
 			notify() {},
 			setStatus(key: string, text: string | undefined) {
@@ -64,7 +73,7 @@ function makeCtx(
 		sessionManager: { getBranch: () => branch },
 		modelRegistry: { find: () => undefined, getAvailable: () => [] },
 	} as unknown as ExtensionContext;
-	return { ctx, statuses };
+	return { ctx, statuses, compactions };
 }
 
 function startSession(handlers: Map<string, Handler>, ctx: ExtensionContext) {
@@ -81,7 +90,7 @@ test.afterEach(() => {
 	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 });
 
-test("turn_start shows current usage vs threshold when Pi stats are available", async () => {
+test("turn_start shows current usage vs threshold", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
 	const { ctx, statuses } = makeCtx(42);
@@ -90,55 +99,53 @@ test("turn_start shows current usage vs threshold when Pi stats are available", 
 	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
 });
 
-test("falls back to self-estimated usage when Pi stats are null", async () => {
+test("shows ? instead of self-estimating when Pi reports unknown usage", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
-	// ~4200 chars/4 = 1050 tokens = 10.5% of 10k window.
-	const branch = [
-		{
-			id: "m1",
-			type: "message",
-			message: {
-				role: "user",
-				content: [{ type: "text", text: "x".repeat(4200) }],
-				timestamp: 1,
-			},
-		},
-	];
-	const { ctx, statuses } = makeCtx(null, branch);
+	// Pi returns null right after compaction, before the next LLM response.
+	const { ctx, statuses, compactions } = makeCtx(null);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: 11%/70%");
+	// Mirrors the footer's "?" — no self-computed estimate, and no compaction
+	// decision without a real number.
+	assert.equal(statuses.get(STATUS_KEY), "ac: ?/70%");
+	assert.equal(compactions.length, 0);
 });
 
-test("shows compacting… with model name while pending, then starred estimate after onError", async () => {
+test("shows compacting… while pending, real usage after onError", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
-	// ~29200 chars/4 = 7300 tokens = 73% of 10k window, above the 70% threshold.
-	const branch = [
-		{
-			id: "m1",
-			type: "message",
-			message: {
-				role: "user",
-				content: [{ type: "text", text: "x".repeat(29200) }],
-				timestamp: 1,
-			},
-		},
-	];
-	const { ctx, statuses } = makeCtx(null, branch);
-	let failCompaction: (() => void) | undefined;
-	(ctx as { compact: unknown }).compact = (options: {
-		onError?: () => void;
-	}) => {
-		failCompaction = options.onError;
-	};
+	const { ctx, statuses, compactions } = makeCtx(80);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	// No compactionModel in the test agent dir, so no @model suffix.
 	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
-	failCompaction?.();
-	assert.equal(statuses.get(STATUS_KEY), "ac: 73%/70% *");
+	compactions[0]?.onError?.();
+	// Compaction failed, context unchanged: Pi still reports 80%.
+	assert.equal(statuses.get(STATUS_KEY), "ac: 80%/70% *");
+});
+
+test("context event guards request size with Pi's usage, not a self-estimate", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const { ctx, statuses, compactions } = makeCtx(80, [], 8000);
+	startSession(handlers, ctx);
+	const messages = [
+		{
+			role: "user",
+			content: [{ type: "text", text: "x".repeat(6000) }],
+			timestamp: 1,
+		},
+		{ role: "user", content: "latest", timestamp: 2 },
+	];
+	const returned = (handlers.get("context")?.({ messages } as never, ctx) ??
+		{}) as { messages?: unknown[] };
+	assert.equal(Array.isArray(returned.messages), true);
+	// 8000 tokens > 70% of the 10k window: keepRecent keeps the notice plus
+	// the newest user message only.
+	assert.equal((returned.messages as unknown[]).length, 2);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(compactions.length, 1);
+	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
 });
 
 test("hides status when plugin is inactive (owner is built-in or off)", async () => {

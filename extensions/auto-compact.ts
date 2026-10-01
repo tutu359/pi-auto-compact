@@ -126,7 +126,7 @@ function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
 	};
 }
 
-/** Estimate current request size using same estimator Pi uses. */
+/** Rough size of a message list; only used for keepRecent's notice text. */
 function estimateTotalTokens(messages: AgentMessage[]): number {
 	return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
@@ -201,7 +201,7 @@ export default function (pi: ExtensionAPI) {
 			onComplete: () => {
 				compactionPending = false;
 				compactionAbortExpected = false;
-				updateStatus(ctx, estimateUsagePercent(ctx));
+				updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
 				if (!resumeTask) return;
 				// Pi may flush queued input during compaction_end. Wait one macrotask
 				// before checking idle, otherwise follow-up can race that flush.
@@ -220,71 +220,27 @@ export default function (pi: ExtensionAPI) {
 			onError: () => {
 				compactionPending = false;
 				compactionAbortExpected = false;
-				updateStatus(ctx, estimateUsagePercent(ctx));
+				updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
 			},
 		});
 	};
 
 	/**
-	 * Self-estimated usage percent, used when Pi's usage stats are unknown
-	 * (e.g. right after compaction, before the next LLM response).
-	 */
-	const estimateUsagePercent = (ctx: ExtensionContext): number | null => {
-		const contextWindow =
-			ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-		if (contextWindow <= 0) return null;
-		try {
-			const entries = ctx.sessionManager.getBranch();
-			// Respect compaction boundaries: only the last compaction summary and
-			// the entries it kept are actually in context; older entries are folded away.
-			let startIdx = 0;
-			let summaryTokens = 0;
-			for (let i = entries.length - 1; i >= 0; i--) {
-				const entry = entries[i];
-				if (entry.type !== "compaction") continue;
-				const summary = (entry as { summary?: string }).summary ?? "";
-				if (summary) {
-					summaryTokens = estimateTokens({
-						role: "user",
-						content: [{ type: "text", text: summary }],
-						timestamp: Date.now(),
-					} as AgentMessage);
-				}
-				const keptId = (entry as { firstKeptEntryId?: string }).firstKeptEntryId;
-				if (keptId) {
-					const keptIdx = entries.findIndex((e) => e.id === keptId);
-					if (keptIdx >= 0) startIdx = keptIdx;
-				}
-				break;
-			}
-			const tokens = entries
-				.slice(startIdx)
-				.reduce(
-					(sum, entry) =>
-						entry.type === "message"
-							? sum + estimateTokens(entry.message as AgentMessage)
-							: sum,
-					summaryTokens,
-				);
-			return (tokens / contextWindow) * 100;
-		} catch {
-			return null;
-		}
-	};
-
-	/**
-	 * Status bar display, same source as the compaction decision: shows the
-	 * exact percent value the check below just used against the threshold.
+	 * Status bar display, single source: ctx.getContextUsage() — the same value
+	 * Pi's footer renders. No self-computed estimates: when Pi reports unknown
+	 * (e.g. right after compaction, before the next LLM response) the footer
+	 * shows "?" and this mirrors it instead of guessing.
 	 */
 	const updateStatus = (ctx: ExtensionContext, percent: number | null) => {
-		if (!active || percent == null) {
+		if (!active) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		const star = percent > autoCompactThreshold ? " *" : "";
+		const shown = percent == null ? "?" : `${Math.round(percent)}%`;
+		const star = percent != null && percent > autoCompactThreshold ? " *" : "";
 		ctx.ui.setStatus(
 			STATUS_KEY,
-			`ac: ${Math.round(percent)}%/${autoCompactThreshold}%${star}`,
+			`ac: ${shown}/${autoCompactThreshold}%${star}`,
 		);
 	};
 
@@ -301,9 +257,10 @@ export default function (pi: ExtensionAPI) {
 	const compactIfNeeded = (ctx: ExtensionContext, resumeTask = true) => {
 		if (!active || compactionPending) return;
 
-		const usage = ctx.getContextUsage();
-		let percent = usage?.percent ?? null;
-		if (percent == null) percent = estimateUsagePercent(ctx);
+		// Single source: Pi's own usage estimate. When Pi reports unknown (right
+		// after compaction, before the next response) skip the decision instead
+		// of estimating; the next provider turn re-checks.
+		const percent = ctx.getContextUsage()?.percent ?? null;
 		updateStatus(ctx, percent);
 		if (percent == null || percent <= autoCompactThreshold) return;
 
@@ -349,15 +306,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event, ctx) => {
 		if (!active || compactionPending) return;
 
-		const contextWindow =
-			ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-		const estimatedTokens = estimateTotalTokens(event.messages);
-		const estimatedPercent =
-			contextWindow > 0 ? (estimatedTokens / contextWindow) * 100 : null;
-		updateStatus(ctx, estimatedPercent);
+		// Same source as the footer and the threshold check: Pi's usage estimate.
+		// No self-computed chars/4 pass over the request messages.
+		const usage = ctx.getContextUsage();
+		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		updateStatus(ctx, usage?.percent ?? null);
 		if (
+			!usage ||
+			usage.tokens == null ||
 			contextWindow <= 0 ||
-			estimatedTokens <= (contextWindow * autoCompactThreshold) / 100
+			usage.tokens <= (contextWindow * autoCompactThreshold) / 100
 		)
 			return;
 
