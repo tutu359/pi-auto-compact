@@ -193,8 +193,23 @@ test("shows compacting… while pending, real usage after onError", async () => 
 test("context event guards request size with Pi's usage, not a self-estimate", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
-	const { ctx, statuses, compactions } = makeCtx(80, [], 8000);
+	// Session starts below threshold; the request crosses it (8000 > 70% of 10k).
+	const projectionMessages = [
+		{
+			role: "assistant",
+			content: [],
+			stopReason: "stop",
+			usage: { totalTokens: 1000, input: 0, output: 0, cacheRead: 1000, cacheWrite: 0 },
+			timestamp: 2,
+		},
+	];
+	const branch = projectionMessages.map((_, i) => ({ id: `entry-${i}`, type: "message" }));
+	const { ctx, statuses, compactions } = makeCtx(10, branch, 1000, projectionMessages);
+	const mutable = ctx as unknown as {
+		getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null };
+	};
 	startSession(handlers, ctx);
+	mutable.getContextUsage = () => ({ tokens: 8000, contextWindow: 10000, percent: 80 });
 	const messages = [
 		{
 			role: "user",

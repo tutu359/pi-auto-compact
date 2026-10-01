@@ -693,9 +693,9 @@ export default function (pi: ExtensionAPI) {
 			active = true;
 		}
 
-		// Resume/fork can load an already-large session before first turn.
-		if (event.reason === "resume" || event.reason === "fork")
-			compactIfNeeded(ctx);
+		// Show the status bar immediately on every session start; large
+		// resumed/forked sessions may already be near the threshold.
+		compactIfNeeded(ctx);
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
