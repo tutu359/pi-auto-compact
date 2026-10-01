@@ -295,11 +295,19 @@ export default function (pi: ExtensionAPI) {
 
 	// Only tool-call turns need mid-run compaction.
 	pi.on("turn_end", (event, ctx) => {
-		if (hasToolCall(event.message)) compactIfNeeded(ctx);
+		if (!hasToolCall(event.message)) return;
+		// Defer one macrotask: Pi persists the turn's messages after emitting
+		// this event, so an immediate read can still miss the fresh usage.
+		setImmediate(() => compactIfNeeded(ctx));
 	});
 
 	// Catch threshold crossings caused by the final provider turn.
-	pi.on("agent_end", (_event, ctx) => compactIfNeeded(ctx, false));
+	pi.on("agent_end", (_event, ctx) => {
+		// Same deferral as turn_end: at the moment agent_end fires, the final
+		// assistant message (with usage) is not persisted yet, so
+		// getContextUsage() reports unknown ("?") right after a compaction.
+		setImmediate(() => compactIfNeeded(ctx, false));
+	});
 
 	// Runs before every provider request. Temporary truncation protects request
 	// size while asynchronous default compaction summarizes persisted history.
