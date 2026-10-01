@@ -40,6 +40,7 @@ function makeCtx(
 	percent: number | null,
 	branch: unknown[] = [],
 	tokens = percent == null ? null : 4200,
+	projectionMessages: unknown[] = [],
 ): {
 	ctx: ExtensionContext;
 	statuses: Map<string, string>;
@@ -70,7 +71,15 @@ function makeCtx(
 			},
 		},
 		model: { contextWindow: 10000 },
-		sessionManager: { getBranch: () => branch },
+		sessionManager: {
+			getBranch: () => branch,
+			// Matches pi's runtime ReadonlySessionManager (v0.99.x), which
+			// exposes the projection used by its own estimator.
+			buildSessionProjection: () => ({
+				messages: projectionMessages,
+				entries: [],
+			}),
+		},
 		modelRegistry: { find: () => undefined, getAvailable: () => [] },
 	} as unknown as ExtensionContext;
 	return { ctx, statuses, compactions };
@@ -99,17 +108,35 @@ test("turn_start shows current usage vs threshold", async () => {
 	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
 });
 
-test("shows ? instead of self-estimating when Pi reports unknown usage", async () => {
+test("falls back to the ported Pi estimator when Pi reports unknown usage", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
-	// Pi returns null right after compaction, before the next LLM response.
-	const { ctx, statuses, compactions } = makeCtx(null);
+	// Pi returns null right after compaction when no post-compaction usage
+	// exists (e.g. providers that never report usage). The plugin then mirrors
+	// Pi's pre-compaction estimator instead of going blind.
+	const projectionMessages = [
+		{ role: "user", content: "h".repeat(4000), timestamp: 1 },
+	];
+	const { ctx, statuses, compactions } = makeCtx(null, [], null, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	// Mirrors the footer's "?" — no self-computed estimate, and no compaction
-	// decision without a real number.
-	assert.equal(statuses.get(STATUS_KEY), "ac: ?/70%");
+	// 4000 chars / 4 = 1000 tokens = 10% of the 10k window: below threshold.
+	assert.equal(statuses.get(STATUS_KEY), "ac: 10%/70%");
 	assert.equal(compactions.length, 0);
+});
+
+test("fallback estimate above threshold triggers compaction", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const projectionMessages = [
+		{ role: "user", content: "h".repeat(36000), timestamp: 1 },
+	];
+	const { ctx, statuses, compactions } = makeCtx(null, [], null, projectionMessages);
+	startSession(handlers, ctx);
+	handlers.get("turn_start")?.({} as never, ctx);
+	// 36000 chars / 4 = 9000 tokens = 90% of the 10k window: over 70%.
+	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
+	assert.equal(compactions.length, 1);
 });
 
 test("shows compacting… while pending, real usage after onError", async () => {

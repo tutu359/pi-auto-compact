@@ -1,5 +1,6 @@
 import {
 	compact,
+	calculateContextTokens,
 	estimateTokens,
 	getAgentDir,
 	SettingsManager,
@@ -131,6 +132,114 @@ function estimateTotalTokens(messages: AgentMessage[]): number {
 	return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
+// ============================================================================
+// Fallback estimate — a faithful port of Pi's own estimator
+// (core/compaction/compaction.js: estimateContextTokens +
+// estimateProjectedContextTokens). Used ONLY when ctx.getContextUsage()
+// returns null, which happens after a compaction when no post-compaction
+// assistant usage exists — e.g. providers that never report usage.
+// ============================================================================
+
+/** Port of Pi's getAssistantUsage: skip aborted/error/all-zero usage. */
+function getAssistantUsage(msg: AgentMessage) {
+	if (msg.role === "assistant" && "usage" in msg) {
+		const assistantMsg = msg as {
+			stopReason?: string;
+			usage?: { totalTokens?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+		};
+		const usage = assistantMsg.usage;
+		const total =
+			usage?.totalTokens ||
+			(usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
+		if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && usage && total > 0) {
+			return usage;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Port of Pi's estimateContextTokens: real usage from the last valid
+ * assistant message + chars/4 estimate for messages after it.
+ */
+function estimateContextTokensPort(messages: AgentMessage[]) {
+	let lastUsageIndex = -1;
+	let usageTokens = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const usage = getAssistantUsage(messages[i]);
+		if (usage) {
+			lastUsageIndex = i;
+			usageTokens =
+				(usage as { totalTokens?: number }).totalTokens ||
+				(usage as { input?: number }).input! + (usage as { output?: number }).output! +
+					(usage as { cacheRead?: number }).cacheRead! + (usage as { cacheWrite?: number }).cacheWrite!;
+			break;
+		}
+	}
+	if (lastUsageIndex === -1) {
+		const estimated = estimateTotalTokens(messages);
+		return { tokens: estimated, usageTokens: 0, lastUsageIndex: -1 };
+	}
+	let trailingTokens = 0;
+	for (let i = lastUsageIndex + 1; i < messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+	return { tokens: usageTokens + trailingTokens, usageTokens, lastUsageIndex };
+}
+
+/**
+ * Port of Pi's estimateProjectedContextTokens: trust usage only if it is
+ * newer than the latest compaction/context_edit entry; otherwise fall back
+ * to a full chars/4 pass over the projected messages.
+ */
+function estimateProjectedContextTokensPort(
+	ctx: ExtensionContext,
+): number {
+	// SAFETY: runtime pi (v0.99.x dist/session-manager.js) exposes
+	// buildSessionProjection on the object passed as ctx.sessionManager;
+	// the local type stubs just omit it from ReadonlySessionManager.
+	const sessionManager = ctx.sessionManager as unknown as {
+		buildSessionProjection(): {
+			messages: AgentMessage[];
+			entries: { messages: AgentMessage[]; sourceEntry: { id: string } }[];
+		};
+		getBranch(): { id: string; type: string }[];
+	};
+	const projection = sessionManager.buildSessionProjection();
+	const branch = ctx.sessionManager.getBranch();
+	const estimate = estimateContextTokensPort(projection.messages);
+
+	if (estimate.lastUsageIndex !== -1) {
+		// Locate the entry that carries the last usage.
+		let projectedMessageIndex = 0;
+		let usageEntryId: string | undefined;
+		for (const entry of projection.entries) {
+			const nextMessageIndex = projectedMessageIndex + entry.messages.length;
+			if (estimate.lastUsageIndex < nextMessageIndex) {
+				usageEntryId = (entry.sourceEntry as { id: string }).id;
+				break;
+			}
+			projectedMessageIndex = nextMessageIndex;
+		}
+		const usageEntryIndex = usageEntryId
+			? branch.findIndex((entry) => entry.id === usageEntryId)
+			: -1;
+		let latestInvalidatingEntryIndex = -1;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			const entryType = entry.type as string;
+			if (entryType === "context_edit" || entryType === "compaction") {
+				latestInvalidatingEntryIndex = i;
+				break;
+			}
+		}
+		if (usageEntryIndex > latestInvalidatingEntryIndex) return estimate.tokens;
+	}
+
+	// Usage is stale or absent: full chars/4 pass (Pi's fallback branch).
+	return estimateTotalTokens(projection.messages);
+}
+
 /**
  * Do not cut inside assistant/toolResult history. A user boundary is safe:
  * tool calls and their results belong to preceding turn.
@@ -257,10 +366,17 @@ export default function (pi: ExtensionAPI) {
 	const compactIfNeeded = (ctx: ExtensionContext, resumeTask = true) => {
 		if (!active || compactionPending) return;
 
-		// Single source: Pi's own usage estimate. When Pi reports unknown (right
-		// after compaction, before the next response) skip the decision instead
-		// of estimating; the next provider turn re-checks.
-		const percent = ctx.getContextUsage()?.percent ?? null;
+		// Single source: Pi's own usage estimate. When Pi reports unknown (after
+		// a compaction with no post-compaction usage — e.g. providers that never
+		// report usage), fall back to a faithful port of Pi's own estimator so
+		// auto-compaction keeps working instead of going blind.
+		let percent = ctx.getContextUsage()?.percent ?? null;
+		if (percent == null) {
+			const contextWindow = ctx.model?.contextWindow ?? 0;
+			if (contextWindow > 0) {
+				percent = (estimateProjectedContextTokensPort(ctx) / contextWindow) * 100;
+			}
+		}
 		updateStatus(ctx, percent);
 		if (percent == null || percent <= autoCompactThreshold) return;
 
@@ -314,9 +430,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event, ctx) => {
 		if (!active || compactionPending) return;
 
-		// Same source as the footer and the threshold check: Pi's usage estimate.
-		// No self-computed chars/4 pass over the request messages.
-		const usage = ctx.getContextUsage();
+		// Same source as the footer and the threshold check: Pi's usage estimate,
+		// with the ported estimator as fallback when Pi reports unknown.
+		let usage = ctx.getContextUsage();
+		if (!usage) {
+			const contextWindow = ctx.model?.contextWindow ?? 0;
+			if (contextWindow > 0) {
+				const tokens = estimateProjectedContextTokensPort(ctx);
+				usage = { tokens, contextWindow, percent: (tokens / contextWindow) * 100 };
+			}
+		}
 		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		updateStatus(ctx, usage?.percent ?? null);
 		if (
