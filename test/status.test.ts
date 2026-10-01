@@ -120,7 +120,7 @@ test("turn_start shows current usage vs threshold", async () => {
 	const { ctx, statuses } = makeCtx(42, branch, 4200, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
+	assert.equal(statuses.get(STATUS_KEY), " ac: 42%/70%");
 });
 
 test("falls back to the ported Pi estimator when Pi reports unknown usage", async () => {
@@ -137,7 +137,7 @@ test("falls back to the ported Pi estimator when Pi reports unknown usage", asyn
 	handlers.get("turn_start")?.({} as never, ctx);
 	// 4000 chars / 4 = 1000 tokens = 10% of the 10k window: below threshold.
 	// No real usage backs the number, so the value is marked with `~`.
-	assert.equal(statuses.get(STATUS_KEY), "ac: ~10%/70%");
+	assert.equal(statuses.get(STATUS_KEY), " ac: ~10%/70%");
 	assert.equal(compactions.length, 0);
 });
 
@@ -153,7 +153,7 @@ test("marks pi's own pre-compaction estimate with ~ when no usage backs it", asy
 	const { ctx, statuses } = makeCtx(10, [], 1000, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: ~10%/70%");
+	assert.equal(statuses.get(STATUS_KEY), " ac: ~10%/70%");
 });
 
 test("shows a plain value when real usage backs the number", async () => {
@@ -175,7 +175,7 @@ test("shows a plain value when real usage backs the number", async () => {
 	const { ctx, statuses } = makeCtx(42, branch, 4200, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
+	assert.equal(statuses.get(STATUS_KEY), " ac: 42%/70%");
 });
 
 test("shows compacting… while pending, real usage after onError", async () => {
@@ -184,10 +184,10 @@ test("shows compacting… while pending, real usage after onError", async () => 
 	const { ctx, statuses, compactions } = makeCtx(80);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
+	assert.equal(statuses.get(STATUS_KEY), " ac: compacting…");
 	compactions[0]?.onError?.();
 	// Compaction failed, context unchanged: Pi still reports 80%.
-	assert.equal(statuses.get(STATUS_KEY), "ac: 80%/70% *");
+	assert.equal(statuses.get(STATUS_KEY), " ac: 80%/70% *");
 });
 
 test("context event guards request size with Pi's usage, not a self-estimate", async () => {
@@ -226,7 +226,7 @@ test("context event guards request size with Pi's usage, not a self-estimate", a
 	assert.equal((returned.messages as unknown[]).length, 2);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(compactions.length, 1);
-	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
+	assert.equal(statuses.get(STATUS_KEY), " ac: compacting…");
 });
 
 test("hides status when plugin is inactive (owner is built-in or off)", async () => {

@@ -34,6 +34,8 @@ const RESUME_MESSAGE_TYPE = "pi-auto-compact/resume";
 const RESUME_MESSAGE = "Auto-compact ran. Continue the current task.";
 const COMPACTION_ABORT_ERROR = "This operation was aborted";
 const STATUS_KEY = "ac";
+/** Nerd Font recycle icon (uf1b8) prefixing the status. */
+const STATUS_ICON = "";
 
 type AutoCompactConfig = {
 	/** When false, this plugin stays inactive (built-in or no compaction in use). */
@@ -359,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 		const star = percent != null && percent > autoCompactThreshold ? " *" : "";
 		ctx.ui.setStatus(
 			STATUS_KEY,
-			`ac: ${shown}/${autoCompactThreshold}%${star}`,
+			`${STATUS_ICON} ac: ${shown}/${autoCompactThreshold}%${star}`,
 		);
 	};
 
@@ -368,8 +370,8 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(
 			STATUS_KEY,
 			compactionModel
-				? `ac: compacting… @${compactionModel.model}`
-				: "ac: compacting…",
+				? `${STATUS_ICON} ac: compacting… @${compactionModel.model}`
+				: `${STATUS_ICON} ac: compacting…`,
 		);
 	};
 
