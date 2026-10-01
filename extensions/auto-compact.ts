@@ -191,10 +191,14 @@ function estimateContextTokensPort(messages: AgentMessage[]) {
  * Port of Pi's estimateProjectedContextTokens: trust usage only if it is
  * newer than the latest compaction/context_edit entry; otherwise fall back
  * to a full chars/4 pass over the projected messages.
+ *
+ * Returns whether the number is backed by real provider usage — the `~`
+ * marker in the status bar is derived from this, not from which code path
+ * produced the number.
  */
 function estimateProjectedContextTokensPort(
 	ctx: ExtensionContext,
-): number {
+): { tokens: number; fromRealUsage: boolean } {
 	// SAFETY: runtime pi (v0.99.x dist/session-manager.js) exposes
 	// buildSessionProjection on the object passed as ctx.sessionManager;
 	// the local type stubs just omit it from ReadonlySessionManager.
@@ -233,11 +237,13 @@ function estimateProjectedContextTokensPort(
 				break;
 			}
 		}
-		if (usageEntryIndex > latestInvalidatingEntryIndex) return estimate.tokens;
+		if (usageEntryIndex > latestInvalidatingEntryIndex) {
+			return { tokens: estimate.tokens, fromRealUsage: true };
+		}
 	}
 
 	// Usage is stale or absent: full chars/4 pass (Pi's fallback branch).
-	return estimateTotalTokens(projection.messages);
+	return { tokens: estimateTotalTokens(projection.messages), fromRealUsage: false };
 }
 
 /**
@@ -340,12 +346,16 @@ export default function (pi: ExtensionAPI) {
 	 * (e.g. right after compaction, before the next LLM response) the footer
 	 * shows "?" and this mirrors it instead of guessing.
 	 */
-	const updateStatus = (ctx: ExtensionContext, percent: number | null) => {
+	const updateStatus = (
+		ctx: ExtensionContext,
+		percent: number | null,
+		fromRealUsage = true,
+	) => {
 		if (!active) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		const shown = percent == null ? "?" : `${Math.round(percent)}%`;
+		const shown = percent == null ? "?" : `${fromRealUsage ? "" : "~"}${Math.round(percent)}%`;
 		const star = percent != null && percent > autoCompactThreshold ? " *" : "";
 		ctx.ui.setStatus(
 			STATUS_KEY,
@@ -366,18 +376,25 @@ export default function (pi: ExtensionAPI) {
 	const compactIfNeeded = (ctx: ExtensionContext, resumeTask = true) => {
 		if (!active || compactionPending) return;
 
-		// Single source: Pi's own usage estimate. When Pi reports unknown (after
-		// a compaction with no post-compaction usage — e.g. providers that never
-		// report usage), fall back to a faithful port of Pi's own estimator so
-		// auto-compaction keeps working instead of going blind.
+		// Single source for the number: Pi's usage, with the ported estimator
+		// as fallback. Single source for the `~` marker: whether the number is
+		// backed by real provider usage (checked via the same port) — so a
+		// value pi itself estimated pre-compaction is marked too.
 		let percent = ctx.getContextUsage()?.percent ?? null;
+		let fromRealUsage = percent != null;
 		if (percent == null) {
 			const contextWindow = ctx.model?.contextWindow ?? 0;
 			if (contextWindow > 0) {
-				percent = (estimateProjectedContextTokensPort(ctx) / contextWindow) * 100;
+				const est = estimateProjectedContextTokensPort(ctx);
+				percent = (est.tokens / contextWindow) * 100;
+				fromRealUsage = est.fromRealUsage;
 			}
+		} else {
+			// Pi returned a number, but verify it is usage-backed; pi's own
+			// pre-compaction estimate path needs the `~` marker as well.
+			fromRealUsage = estimateProjectedContextTokensPort(ctx).fromRealUsage;
 		}
-		updateStatus(ctx, percent);
+		updateStatus(ctx, percent, fromRealUsage);
 		if (percent == null || percent <= autoCompactThreshold) return;
 
 		compactionPending = true;
@@ -431,17 +448,22 @@ export default function (pi: ExtensionAPI) {
 		if (!active || compactionPending) return;
 
 		// Same source as the footer and the threshold check: Pi's usage estimate,
-		// with the ported estimator as fallback when Pi reports unknown.
+		// with the ported estimator as fallback when Pi reports unknown. The
+		// `~` marker uses the same usage-backed check as compactIfNeeded.
 		let usage = ctx.getContextUsage();
+		let fromRealUsage = usage != null;
 		if (!usage) {
 			const contextWindow = ctx.model?.contextWindow ?? 0;
 			if (contextWindow > 0) {
-				const tokens = estimateProjectedContextTokensPort(ctx);
-				usage = { tokens, contextWindow, percent: (tokens / contextWindow) * 100 };
+				const est = estimateProjectedContextTokensPort(ctx);
+				usage = { tokens: est.tokens, contextWindow, percent: (est.tokens / contextWindow) * 100 };
+				fromRealUsage = est.fromRealUsage;
 			}
+		} else {
+			fromRealUsage = estimateProjectedContextTokensPort(ctx).fromRealUsage;
 		}
 		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-		updateStatus(ctx, usage?.percent ?? null);
+		updateStatus(ctx, usage?.percent ?? null, fromRealUsage);
 		if (
 			!usage ||
 			usage.tokens == null ||

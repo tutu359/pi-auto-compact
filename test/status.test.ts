@@ -74,10 +74,14 @@ function makeCtx(
 		sessionManager: {
 			getBranch: () => branch,
 			// Matches pi's runtime ReadonlySessionManager (v0.99.x), which
-			// exposes the projection used by its own estimator.
+			// exposes the projection used by its own estimator. Entries mirror
+			// the messages one-to-one so usage-entry lookups resolve.
 			buildSessionProjection: () => ({
 				messages: projectionMessages,
-				entries: [],
+				entries: projectionMessages.map((m, i) => ({
+					messages: [m],
+					sourceEntry: { id: `entry-${i}` },
+				})),
 			}),
 		},
 		modelRegistry: { find: () => undefined, getAvailable: () => [] },
@@ -102,7 +106,18 @@ test.afterEach(() => {
 test("turn_start shows current usage vs threshold", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
-	const { ctx, statuses } = makeCtx(42);
+	// Real usage-backed projection: pi's 42% is trusted verbatim.
+	const projectionMessages = [
+		{
+			role: "assistant",
+			content: [],
+			stopReason: "stop",
+			usage: { totalTokens: 4200, input: 0, output: 0, cacheRead: 4200, cacheWrite: 0 },
+			timestamp: 2,
+		},
+	];
+	const branch = projectionMessages.map((_, i) => ({ id: `entry-${i}`, type: "message" }));
+	const { ctx, statuses } = makeCtx(42, branch, 4200, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
 	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
@@ -121,22 +136,46 @@ test("falls back to the ported Pi estimator when Pi reports unknown usage", asyn
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
 	// 4000 chars / 4 = 1000 tokens = 10% of the 10k window: below threshold.
-	assert.equal(statuses.get(STATUS_KEY), "ac: 10%/70%");
+	// No real usage backs the number, so the value is marked with `~`.
+	assert.equal(statuses.get(STATUS_KEY), "ac: ~10%/70%");
 	assert.equal(compactions.length, 0);
 });
 
-test("fallback estimate above threshold triggers compaction", async () => {
+test("marks pi's own pre-compaction estimate with ~ when no usage backs it", async () => {
 	await withTempAgentDir();
 	const handlers = loadExtension();
+	// New session, no compaction: pi still returns a number (its own internal
+	// estimate) because zero usage is not "unknown" to it. The plugin detects
+	// that no real usage backs the value and marks it with `~`.
 	const projectionMessages = [
-		{ role: "user", content: "h".repeat(36000), timestamp: 1 },
+		{ role: "user", content: "h".repeat(4000), timestamp: 1 },
 	];
-	const { ctx, statuses, compactions } = makeCtx(null, [], null, projectionMessages);
+	const { ctx, statuses } = makeCtx(10, [], 1000, projectionMessages);
 	startSession(handlers, ctx);
 	handlers.get("turn_start")?.({} as never, ctx);
-	// 36000 chars / 4 = 9000 tokens = 90% of the 10k window: over 70%.
-	assert.equal(statuses.get(STATUS_KEY), "ac: compacting…");
-	assert.equal(compactions.length, 1);
+	assert.equal(statuses.get(STATUS_KEY), "ac: ~10%/70%");
+});
+
+test("shows a plain value when real usage backs the number", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	// Projection carries a valid assistant usage newer than any compaction:
+	// pi's number is real, no `~` marker.
+	const projectionMessages = [
+		{ role: "user", content: "h".repeat(4000), timestamp: 1 },
+		{
+			role: "assistant",
+			content: [],
+			stopReason: "stop",
+			usage: { totalTokens: 4200, input: 0, output: 0, cacheRead: 4200, cacheWrite: 0 },
+			timestamp: 2,
+		},
+	];
+	const branch = projectionMessages.map((_, i) => ({ id: `entry-${i}`, type: "message" }));
+	const { ctx, statuses } = makeCtx(42, branch, 4200, projectionMessages);
+	startSession(handlers, ctx);
+	handlers.get("turn_start")?.({} as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "ac: 42%/70%");
 });
 
 test("shows compacting… while pending, real usage after onError", async () => {
