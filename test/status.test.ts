@@ -520,3 +520,59 @@ test("providers that never report usage still compact on the estimate", async ()
 	startSession(handlers, ctx);
 	assert.equal(compactions.length, 1);
 });
+
+// ==========================================================================
+// Manual /compact status lifecycle: compacting… during, refresh after.
+// ==========================================================================
+
+test("session_before_compact shows compacting status for manual /compact", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const { ctx, statuses } = makeCtx(10);
+	startSession(handlers, ctx);
+	// No usage-backed projection: pi's own estimate is marked with `~`.
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: ~10%/70%");
+	await handlers.get("session_before_compact")?.(manualCompactEvent() as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
+});
+
+test("session_compact refreshes the status after a manual /compact", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const { ctx, statuses } = makeCtx(10);
+	startSession(handlers, ctx);
+	await handlers.get("session_before_compact")?.(manualCompactEvent() as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
+	// Post-compaction: pi reports unknown usage until the next response.
+	const mutable = ctx as unknown as {
+		getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null };
+	};
+	mutable.getContextUsage = () => ({ tokens: null, contextWindow: 10000, percent: null });
+	handlers.get("session_compact")?.({} as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: ?/70%");
+});
+
+test("session_compact leaves plugin-triggered compactions to onComplete", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const { ctx, statuses, compactions } = makeCtx(80);
+	startSession(handlers, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
+	// The live reading (~80%) must not replace "compacting…" while the
+	// plugin's own compaction is still in flight.
+	handlers.get("session_compact")?.({} as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
+	assert.equal(compactions.length, 1);
+});
+
+test("session_compact_failed refreshes status after a failed manual /compact", async () => {
+	await withTempAgentDir();
+	const handlers = loadExtension();
+	const { ctx, statuses } = makeCtx(10);
+	startSession(handlers, ctx);
+	await handlers.get("session_before_compact")?.(manualCompactEvent() as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
+	// Compaction failed: context unchanged, status back to the live reading.
+	handlers.get("session_compact_failed")?.({} as never, ctx);
+	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: 10%/70%");
+});

@@ -771,6 +771,12 @@ export default function (pi: ExtensionAPI) {
 		// continuity restore below).
 		if (!active) return;
 
+		// Show "compacting…" from the moment the LLM call is about to start.
+		// For plugin-triggered compactions runCompaction already set the same
+		// status (idempotent); for manual /compact this is the only start hook
+		// extensions get (pi's compaction_start is TUI-internal).
+		setCompactingStatus(ctx);
+
 		// Pi omits details from prior extension compactions when preparing next run.
 		const previous = [...event.branchEntries]
 			.reverse()
@@ -846,10 +852,27 @@ export default function (pi: ExtensionAPI) {
 			return { compaction: result };
 		} catch (error) {
 			if (event.signal.aborted) return;
+			// Restore a live status reading; pi falls back to the session model.
+			updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
 			ctx.ui.notify(
 				`Compaction with ${compactionModel.provider}/${compactionModel.model} failed; using session model. ${(error as Error).message}`,
 				"error",
 			);
 		}
+	});
+
+	// Manual /compact status lifecycle: completion refresh. The plugin's own
+	// triggers reset the status via ctx.compact's onComplete/onError; manual
+	// compactions only surface here (and in session_compact_failed below).
+	pi.on("session_compact", (_event, ctx) => {
+		if (!active || compactionPending) return;
+		updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
+	});
+
+	// Manual /compact failed or was cancelled: refresh so "compacting…"
+	// does not linger until the next turn boundary.
+	pi.on("session_compact_failed", (_event, ctx) => {
+		if (!active || compactionPending) return;
+		updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
 	});
 }
