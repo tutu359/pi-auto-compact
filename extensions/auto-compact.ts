@@ -1,6 +1,5 @@
 import {
 	compact,
-	calculateContextTokens,
 	estimateTokens,
 	getAgentDir,
 	SettingsManager,
@@ -32,7 +31,6 @@ const COMPACTION_INSTRUCTIONS =
 	"Preserve current task to be resumed after compaction.";
 const RESUME_MESSAGE_TYPE = "pi-auto-compact/resume";
 const RESUME_MESSAGE = "Auto-compact ran. Continue the current task.";
-const COMPACTION_ABORT_ERROR = "This operation was aborted";
 const STATUS_KEY = "ac";
 /** Nerd Font recycle icon (uf1b8) prefixing the status. */
 const STATUS_ICON = "";
@@ -129,6 +127,36 @@ function parseAutoCompactConfig(value: unknown): AutoCompactConfig {
 	};
 }
 
+/**
+ * Abort error texts seen on aborted assistant messages: undici's fetch abort
+ * (DOMException) says "This operation was aborted", Pi's own utils/abort.js
+ * Error says "The operation was aborted". Match both, loosely, so the
+ * rewrite below does not depend on which layer produced the error.
+ */
+function isAbortErrorMessage(errorMessage: unknown): boolean {
+	return (
+		typeof errorMessage === "string" &&
+		errorMessage.includes("operation was aborted")
+	);
+}
+
+/**
+ * Content worth keeping visible: non-empty text, tool calls, or any other
+ * payload. Thinking blocks and empty text parts are not — an abort that
+ * streamed only partial thinking should still be rewritten into a quiet
+ * stop instead of surfacing as an error.
+ */
+function hasVisibleContent(message: AgentMessage): boolean {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content !== "";
+	if (!Array.isArray(content)) return true; // unknown shape: don't touch
+	return content.some(
+		(part) =>
+			(part.type === "text" && part.text !== "") ||
+			(part.type !== "text" && part.type !== "thinking"),
+	);
+}
+
 /** Rough size of a message list; only used for keepRecent's notice text. */
 function estimateTotalTokens(messages: AgentMessage[]): number {
 	return messages.reduce((total, message) => total + estimateTokens(message), 0);
@@ -173,8 +201,10 @@ function estimateContextTokensPort(messages: AgentMessage[]) {
 			lastUsageIndex = i;
 			usageTokens =
 				(usage as { totalTokens?: number }).totalTokens ||
-				(usage as { input?: number }).input! + (usage as { output?: number }).output! +
-					(usage as { cacheRead?: number }).cacheRead! + (usage as { cacheWrite?: number }).cacheWrite!;
+				((usage as { input?: number }).input ?? 0) +
+				((usage as { output?: number }).output ?? 0) +
+				((usage as { cacheRead?: number }).cacheRead ?? 0) +
+				((usage as { cacheWrite?: number }).cacheWrite ?? 0);
 			break;
 		}
 	}
@@ -200,7 +230,7 @@ function estimateContextTokensPort(messages: AgentMessage[]) {
  */
 function estimateProjectedContextTokensPort(
 	ctx: ExtensionContext,
-): { tokens: number; fromRealUsage: boolean } {
+): { tokens: number; fromRealUsage: boolean; usageExists: boolean } {
 	// SAFETY: runtime pi (v0.99.x dist/session-manager.js) exposes
 	// buildSessionProjection on the object passed as ctx.sessionManager;
 	// the local type stubs just omit it from ReadonlySessionManager.
@@ -240,21 +270,37 @@ function estimateProjectedContextTokensPort(
 			}
 		}
 		if (usageEntryIndex > latestInvalidatingEntryIndex) {
-			return { tokens: estimate.tokens, fromRealUsage: true };
+			return { tokens: estimate.tokens, fromRealUsage: true, usageExists: true };
 		}
 	}
 
 	// Usage is stale or absent: full chars/4 pass (Pi's fallback branch).
-	return { tokens: estimateTotalTokens(projection.messages), fromRealUsage: false };
+	// usageExists distinguishes "usage exists but predates the latest
+	// compaction" (wait for the next response — see holdOff below) from
+	// "this provider never reports usage" (the estimate is the only signal).
+	return {
+		tokens: estimateTotalTokens(projection.messages),
+		fromRealUsage: false,
+		usageExists: estimate.lastUsageIndex !== -1,
+	};
 }
 
 /**
  * Do not cut inside assistant/toolResult history. A user boundary is safe:
- * tool calls and their results belong to preceding turn.
+ * tool calls and their results belong to the preceding turn. Prefer the next
+ * user boundary at or after `index` (drops the orphan head of a turn); when
+ * the keep window lands inside the current (latest) turn there is no later
+ * user message, so fall back to that turn's opening user message — keeping
+ * a valid, meaningful request beats collapsing it to a bare notice. Returns
+ * -1 when no safe cut exists.
  */
 function snapToUserBoundary(messages: AgentMessage[], index: number): number {
-	while (index < messages.length && messages[index].role !== "user") index++;
-	return index;
+	let forward = index;
+	while (forward < messages.length && messages[forward].role !== "user") forward++;
+	if (forward < messages.length) return forward;
+	let backward = Math.min(index, messages.length - 1);
+	while (backward >= 0 && messages[backward].role !== "user") backward--;
+	return backward;
 }
 
 /**
@@ -266,7 +312,7 @@ function keepRecent(
 	keepTokens: number,
 ): AgentMessage[] | null {
 	let tokens = 0;
-	let cutIndex = 0;
+	let cutIndex = -1;
 
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const messageTokens = estimateTokens(messages[i]);
@@ -277,6 +323,10 @@ function keepRecent(
 		tokens += messageTokens;
 	}
 
+	// -1: everything fits inside the keep window. 0 or -1 from the snap: no
+	// messages can be removed at a safe boundary (single oversized turn) —
+	// leave the request untruncated; the scheduled compaction still protects
+	// the session.
 	if (cutIndex <= 0) return null;
 
 	const removed = messages.slice(0, cutIndex);
@@ -384,12 +434,20 @@ export default function (pi: ExtensionAPI) {
 		// value pi itself estimated pre-compaction is marked too.
 		let percent = ctx.getContextUsage()?.percent ?? null;
 		let fromRealUsage = percent != null;
+		// Post-compaction hold-off (mirrors Pi's own semantics): when the only
+		// usage data predates the latest compaction, wait for the next response
+		// instead of acting on a rough estimate — otherwise a kept tail that is
+		// still above threshold would retrigger compaction in a loop. Providers
+		// that never report usage have no usage at all and still act on the
+		// estimate.
+		let holdOff = false;
 		if (percent == null) {
 			const contextWindow = ctx.model?.contextWindow ?? 0;
 			if (contextWindow > 0) {
 				const est = estimateProjectedContextTokensPort(ctx);
 				percent = (est.tokens / contextWindow) * 100;
 				fromRealUsage = est.fromRealUsage;
+				holdOff = !est.fromRealUsage && est.usageExists;
 			}
 		} else {
 			// Pi returned a number, but verify it is usage-backed; pi's own
@@ -397,7 +455,7 @@ export default function (pi: ExtensionAPI) {
 			fromRealUsage = estimateProjectedContextTokensPort(ctx).fromRealUsage;
 		}
 		updateStatus(ctx, percent, fromRealUsage);
-		if (percent == null || percent <= autoCompactThreshold) return;
+		if (percent == null || holdOff || percent <= autoCompactThreshold) return;
 
 		compactionPending = true;
 		runCompaction(ctx, resumeTask);
@@ -412,8 +470,8 @@ export default function (pi: ExtensionAPI) {
 			!ctx.signal?.aborted ||
 			message.role !== "assistant" ||
 			message.stopReason !== "error" ||
-			message.errorMessage !== COMPACTION_ABORT_ERROR ||
-			message.content.some((part) => part.type !== "text" || part.text !== "")
+			!isAbortErrorMessage(message.errorMessage) ||
+			hasVisibleContent(message)
 		)
 			return;
 
@@ -445,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Runs before every provider request. Temporary truncation protects request
-	// size while asynchronous default compaction summarizes persisted history.
+	// size while asynchronous compaction summarizes persisted history.
 	pi.on("context", (event, ctx) => {
 		if (!active || compactionPending) return;
 
@@ -454,12 +512,16 @@ export default function (pi: ExtensionAPI) {
 		// `~` marker uses the same usage-backed check as compactIfNeeded.
 		let usage = ctx.getContextUsage();
 		let fromRealUsage = usage != null;
+		// Same post-compaction hold-off as compactIfNeeded: stale usage means
+		// wait for the next response; never-reporting providers still act.
+		let holdOff = false;
 		if (!usage) {
 			const contextWindow = ctx.model?.contextWindow ?? 0;
 			if (contextWindow > 0) {
 				const est = estimateProjectedContextTokensPort(ctx);
 				usage = { tokens: est.tokens, contextWindow, percent: (est.tokens / contextWindow) * 100 };
 				fromRealUsage = est.fromRealUsage;
+				holdOff = !est.fromRealUsage && est.usageExists;
 			}
 		} else {
 			fromRealUsage = estimateProjectedContextTokensPort(ctx).fromRealUsage;
@@ -470,21 +532,24 @@ export default function (pi: ExtensionAPI) {
 			!usage ||
 			usage.tokens == null ||
 			contextWindow <= 0 ||
+			holdOff ||
 			usage.tokens <= (contextWindow * autoCompactThreshold) / 100
 		)
 			return;
-
-		const truncated = keepRecent(
-			event.messages,
-			Math.floor((contextWindow * KEEP_RECENT_PERCENT) / 100),
-		);
-		if (!truncated) return;
 
 		// Mark pending before deferring. Another context event can fire before
 		// setImmediate runs, and must not schedule a second compaction.
 		compactionPending = true;
 		setImmediate(() => runCompaction(ctx));
-		return { messages: truncated };
+		// Best-effort request guard: truncate to the keep window when a safe
+		// user boundary exists. When no safe cut exists (single oversized turn)
+		// the request goes out untruncated — the compaction scheduled above
+		// still protects the session.
+		const truncated = keepRecent(
+			event.messages,
+			Math.floor((contextWindow * KEEP_RECENT_PERCENT) / 100),
+		);
+		return truncated ? { messages: truncated } : undefined;
 	});
 
 	pi.registerCommand("auto-compact", {
@@ -631,13 +696,12 @@ export default function (pi: ExtensionAPI) {
 					: `Auto-compact: threshold ${autoCompactThreshold}%, session model.`,
 				"info",
 			);
-			ctx.ui.notify("Restart Pi for model changes to take effect.", "info");
 		},
 	});
 
 	// Pi's built-in automatic compaction competes with this extension. Refuse
 	// activation unless effective global/project settings disable it.
-	pi.on("session_start", (event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		configPath = join(getAgentDir(), "config", "pi-auto-compact", "config.json");
 		let parsed: AutoCompactConfig | null = null;
 		try {
@@ -701,12 +765,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (
-			!active ||
-			!compactionPending ||
-			event.customInstructions !== COMPACTION_INSTRUCTIONS
-		)
-			return;
+		// Intercept every compaction while this plugin owns compaction: the
+		// plugin's own automatic triggers, manual /compact, and any recovery
+		// path — all use the configured compaction model (and the details
+		// continuity restore below).
+		if (!active) return;
 
 		// Pi omits details from prior extension compactions when preparing next run.
 		const previous = [...event.branchEntries]
@@ -780,10 +843,7 @@ export default function (pi: ExtensionAPI) {
 				`Compacted with ${compactionModel.provider}/${compactionModel.model}.`,
 				"info",
 			);
-			return {
-				compaction: result,
-				usedModel: `${compactionModel.provider}/${compactionModel.model}`,
-			};
+			return { compaction: result };
 		} catch (error) {
 			if (event.signal.aborted) return;
 			ctx.ui.notify(

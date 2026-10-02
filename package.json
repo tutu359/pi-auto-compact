@@ -1,7 +1,7 @@
 {
   "name": "pi-auto-compact",
   "version": "1.0.0",
-  "description": "Proactively compact Pi context at a configurable threshold and resume the current task. Standalone fork of HenryQW/pi-harness pi-auto-compact with dependencies removed (uses the current session model).",
+  "description": "Proactively compact Pi context at a configurable threshold and resume the current task. Standalone fork of HenryQW/pi-harness pi-auto-compact with dependencies removed; compacts with the session model or an optional dedicated compaction model (used for automatic and manual /compact alike).",
   "keywords": [
     "pi-package",
     "pi",
