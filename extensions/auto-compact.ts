@@ -861,12 +861,33 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Manual /compact status lifecycle: completion refresh. The plugin's own
-	// triggers reset the status via ctx.compact's onComplete/onError; manual
-	// compactions only surface here (and in session_compact_failed below).
-	pi.on("session_compact", (_event, ctx) => {
-		if (!active || compactionPending) return;
-		updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
+	// Compaction completion: refresh the status bar for manual compactions
+	// (the plugin's own triggers reset it via ctx.compact's onComplete/onError)
+	// and append a persistent transcript notice naming the model — toasts are
+	// transient and easy to miss, and pi's native "Compacted from N tokens"
+	// line carries no model info. display:true renders it in the transcript
+	// ([pi-auto-compact] Compacted …); like the resume message it also reaches
+	// the model as a tiny user-role note.
+	pi.on("session_compact", (event, ctx) => {
+		if (!active) return;
+		if (!compactionPending) {
+			updateStatus(ctx, ctx.getContextUsage()?.percent ?? null);
+		}
+		const model = compactionModel
+			? `${compactionModel.provider}/${compactionModel.model}`
+			: ctx.model
+				? `${ctx.model.provider}/${ctx.model.id} (session model)`
+				: "session model";
+		const tokensBefore = event.compactionEntry?.tokensBefore;
+		const from =
+			typeof tokensBefore === "number"
+				? ` from ${tokensBefore.toLocaleString()} tokens`
+				: "";
+		void pi.sendMessage({
+			customType: "pi-auto-compact",
+			content: `Compacted${from} with ${model}.`,
+			display: true,
+		});
 	});
 
 	// Manual /compact failed or was cancelled: refresh so "compacting…"

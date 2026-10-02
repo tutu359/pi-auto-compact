@@ -34,14 +34,18 @@ async function withPluginConfig(config: unknown): Promise<string> {
 	return dir;
 }
 
-function loadExtension(): Map<string, Handler> {
+function loadExtension(sentCustom?: Array<Record<string, unknown>>): Map<string, Handler> {
 	const handlers = new Map<string, Handler>();
+	const sink = sentCustom ?? [];
 	autoCompact({
 		on(event: string, handler: Handler) {
 			handlers.set(event, handler);
 		},
 		registerCommand() {},
-		sendMessage() {},
+		sendMessage(message: Record<string, unknown>) {
+			sink.push(message);
+			return Promise.resolve();
+		},
 		sendUserMessage() {},
 	} as unknown as ExtensionAPI);
 	return handlers;
@@ -89,7 +93,7 @@ function makeCtx(
 				else statuses.set(key, text);
 			},
 		},
-		model: { contextWindow: 10000 },
+		model: { provider: "sessprov", id: "sessmodel", contextWindow: 10000 },
 		sessionManager: {
 			getBranch: () => branch,
 			// Matches pi's runtime ReadonlySessionManager (v0.99.x), which
@@ -536,9 +540,10 @@ test("session_before_compact shows compacting status for manual /compact", async
 	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
 });
 
-test("session_compact refreshes the status after a manual /compact", async () => {
+test("session_compact refreshes the status and appends a persistent notice after a manual /compact", async () => {
 	await withTempAgentDir();
-	const handlers = loadExtension();
+	const sentCustom: Array<Record<string, unknown>> = [];
+	const handlers = loadExtension(sentCustom);
 	const { ctx, statuses } = makeCtx(10);
 	startSession(handlers, ctx);
 	await handlers.get("session_before_compact")?.(manualCompactEvent() as never, ctx);
@@ -548,26 +553,59 @@ test("session_compact refreshes the status after a manual /compact", async () =>
 		getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null };
 	};
 	mutable.getContextUsage = () => ({ tokens: null, contextWindow: 10000, percent: null });
-	handlers.get("session_compact")?.({} as never, ctx);
+	handlers.get("session_compact")?.({ compactionEntry: { tokensBefore: 410643 } } as never, ctx);
 	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: ?/70%");
+	const notice = sentCustom.find((m) => m.customType === "pi-auto-compact");
+	assert.ok(notice, "persistent notice appended");
+	assert.equal(notice.display, true);
+	assert.equal(
+		notice.content,
+		"Compacted from 410,643 tokens with sessprov/sessmodel (session model).",
+	);
 });
 
-test("session_compact leaves plugin-triggered compactions to onComplete", async () => {
+test("session_compact appends the notice for plugin-triggered compactions too", async () => {
 	await withTempAgentDir();
-	const handlers = loadExtension();
+	const sentCustom: Array<Record<string, unknown>> = [];
+	const handlers = loadExtension(sentCustom);
 	const { ctx, statuses, compactions } = makeCtx(80);
 	startSession(handlers, ctx);
 	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
 	// The live reading (~80%) must not replace "compacting…" while the
 	// plugin's own compaction is still in flight.
-	handlers.get("session_compact")?.({} as never, ctx);
+	handlers.get("session_compact")?.({ compactionEntry: { tokensBefore: 8000 } } as never, ctx);
 	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: compacting…");
 	assert.equal(compactions.length, 1);
+	const notice = sentCustom.find((m) => m.customType === "pi-auto-compact");
+	assert.ok(notice, "persistent notice appended for plugin-triggered compaction");
+	assert.equal(notice.content, "Compacted from 8,000 tokens with sessprov/sessmodel (session model).");
 });
 
-test("session_compact_failed refreshes status after a failed manual /compact", async () => {
+test("session_compact notice names the configured compaction model", async () => {
+	await withPluginConfig({
+		enabled: true,
+		autoCompactThreshold: 70,
+		compactionModel: { provider: "testprov", model: "testmodel" },
+	});
+	const sentCustom: Array<Record<string, unknown>> = [];
+	const handlers = loadExtension(sentCustom);
+	// session_start resolves the configured model through the registry.
+	const registry = {
+		find: (provider: string, model: string) => ({ provider, id: model, contextWindow: 10000 }),
+		getAvailable: () => [],
+	};
+	const { ctx } = makeCtx(10, [], undefined, [], registry);
+	startSession(handlers, ctx);
+	handlers.get("session_compact")?.({ compactionEntry: { tokensBefore: 410643 } } as never, ctx);
+	const notice = sentCustom.find((m) => m.customType === "pi-auto-compact");
+	assert.ok(notice, "persistent notice appended");
+	assert.equal(notice.content, "Compacted from 410,643 tokens with testprov/testmodel.");
+});
+
+test("session_compact_failed refreshes status and appends no notice", async () => {
 	await withTempAgentDir();
-	const handlers = loadExtension();
+	const sentCustom: Array<Record<string, unknown>> = [];
+	const handlers = loadExtension(sentCustom);
 	const { ctx, statuses } = makeCtx(10);
 	startSession(handlers, ctx);
 	await handlers.get("session_before_compact")?.(manualCompactEvent() as never, ctx);
@@ -575,4 +613,5 @@ test("session_compact_failed refreshes status after a failed manual /compact", a
 	// Compaction failed: context unchanged, status back to the live reading.
 	handlers.get("session_compact_failed")?.({} as never, ctx);
 	assert.equal(statuses.get(STATUS_KEY), "\uf1b8 ac: 10%/70%");
+	assert.equal(sentCustom.filter((m) => m.customType === "pi-auto-compact").length, 0);
 });

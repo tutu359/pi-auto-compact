@@ -36,7 +36,7 @@ pi install git:github.com/tutu359/pi-auto-compact
 
 选 owner 会直接改写 `~/.pi/agent/settings.json`，无需手动编辑。插件接管时，上下文用量超过阈值自动压缩并继续当前任务。
 
-手动 `/compact` 与自动压缩体验一致：状态栏显示 `♻ ac: compacting… @模型`，完成后弹出 `Compacted with provider/model.` 提示并刷新状态栏；失败也会刷新状态栏并提示回退用的模型。
+手动 `/compact` 与自动压缩体验一致：状态栏显示 `♻ ac: compacting… @模型`，完成后刷新状态栏，并在消息流中追加一条永久提示 `[pi-auto-compact] Compacted from N tokens with provider/model.`（toast 转瞬即逝，这条永久可见；失败同样会刷新状态栏并提示回退模型）。
 
 ## 指定压缩模型（可选）
 
